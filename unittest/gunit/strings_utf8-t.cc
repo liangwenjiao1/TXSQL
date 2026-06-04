@@ -22,8 +22,14 @@
    Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301  USA */
 
 #include <gtest/gtest.h>
+#include <algorithm>
 #include <string>
+#include <utility>
+#include <vector>
 
+#if defined(HAVE_SVE_ACLE)
+#include "ctype_sve_test.h"
+#endif
 #include "m_ctype.h"
 #include "mf_wcomp.h"  // wild_compare_full, wild_one, wild_any
 #include "my_inttypes.h"
@@ -755,6 +761,767 @@ TEST(UCAWildCmpTest, UCA900WildCmp_AS_CI) {
   EXPECT_TRUE(uca_wildcmp(cs, "Ǎḅdbçd", "ǎ%Çd"));
   EXPECT_FALSE(uca_wildcmp(cs, "Ǎḅeçd", "a%bd"));
 }
+
+#if defined(HAVE_SVE_ACLE)
+
+class ScopedSVETestMode {
+ public:
+  ScopedSVETestMode() : saved_mode(my_sve_test_get_mode()) {}
+  ~ScopedSVETestMode() { my_sve_test_set_mode(saved_mode); }
+
+ private:
+  int saved_mode;
+};
+
+static CHARSET_INFO *find_collation(const char *name) {
+  MY_CHARSET_LOADER loader;
+  return my_collation_get_by_name(&loader, name, MYF(0));
+}
+
+template <typename Result, typename Fn>
+static Result run_with_sve_mode(int mode, Fn fn,
+                                my_sve_test_metrics *metrics) {
+  my_sve_test_reset_metrics();
+  my_sve_test_set_mode(mode);
+  Result result = fn();
+  my_sve_test_get_metrics(metrics);
+  return result;
+}
+
+static size_t sve_test_lane_bytes() {
+  const size_t lane = my_sve_test_lane_bytes();
+  return lane != 0 ? lane : 16;
+}
+
+static void expect_fast_path_if_available(
+    const my_sve_test_metrics &metrics) {
+  if (my_sve_test_runtime_available()) {
+    EXPECT_GT(metrics.fast_calls, 0ULL);
+  } else {
+    EXPECT_EQ(metrics.fast_calls, 0ULL);
+  }
+}
+
+struct StrnxfrmResult {
+  size_t written;
+  std::string bytes;
+
+  bool operator==(const StrnxfrmResult &other) const {
+    return written == other.written && bytes == other.bytes;
+  }
+};
+
+using HashSortResult = std::pair<uint64, uint64>;
+
+static StrnxfrmResult run_strnxfrm(const CHARSET_INFO *cs,
+                                   const std::string &src, size_t dstlen,
+                                   uint flags) {
+  std::vector<uchar> dst(std::max<size_t>(dstlen, 1), 0);
+  const size_t written = cs->coll->strnxfrm(
+      cs, dst.data(), dstlen, static_cast<uint>(dstlen),
+      pointer_cast<const uchar *>(src.data()), src.size(), flags);
+  return {written, std::string(pointer_cast<const char *>(dst.data()),
+                               std::min(written, dstlen))};
+}
+
+static HashSortResult run_hash_sort(const CHARSET_INFO *cs,
+                                    const std::string &src) {
+  uint64 nr1 = 1;
+  uint64 nr2 = 4;
+  cs->coll->hash_sort(cs, pointer_cast<const uchar *>(src.data()), src.size(),
+                      &nr1, &nr2);
+  return std::make_pair(nr1, nr2);
+}
+
+static int run_strnncoll(const CHARSET_INFO *cs, const std::string &lhs,
+                         const std::string &rhs, bool t_is_prefix) {
+  return cs->coll->strnncoll(cs, pointer_cast<const uchar *>(lhs.data()),
+                             lhs.size(),
+                             pointer_cast<const uchar *>(rhs.data()),
+                             rhs.size(), t_is_prefix);
+}
+
+static int run_strnncollsp(const CHARSET_INFO *cs, const std::string &lhs,
+                           const std::string &rhs) {
+  return cs->coll->strnncollsp(cs, pointer_cast<const uchar *>(lhs.data()),
+                               lhs.size(),
+                               pointer_cast<const uchar *>(rhs.data()),
+                               rhs.size());
+}
+
+static int signum(int value) { return (value > 0) - (value < 0); }
+
+static std::string run_caseup(const CHARSET_INFO *cs, const std::string &src) {
+  std::vector<char> buffer(src.begin(), src.end());
+  buffer.push_back('\0');
+  const size_t len = my_caseup_str(cs, buffer.data());
+  return std::string(buffer.data(), len);
+}
+
+static std::string run_casedn(const CHARSET_INFO *cs, const std::string &src) {
+  std::vector<char> buffer(src.begin(), src.end());
+  buffer.push_back('\0');
+  const size_t len = my_casedn_str(cs, buffer.data());
+  return std::string(buffer.data(), len);
+}
+
+TEST(SVEOptimizedCollationScopeTest, Utf8GeneralCiAsciiStrcasecmp) {
+  ScopedSVETestMode sve_scope;
+  CHARSET_INFO *cs = find_collation("utf8_general_ci");
+  ASSERT_NE(nullptr, cs);
+
+  const size_t lane = sve_test_lane_bytes();
+  std::string lhs(lane * 2, 'a');
+  std::string rhs(lane * 2, 'A');
+  my_sve_test_metrics auto_metrics = {};
+  my_sve_test_metrics scalar_metrics = {};
+
+  const int auto_result = run_with_sve_mode<int>(
+      MY_SVE_TEST_MODE_AUTO, [&]() { return cs->coll->strcasecmp(cs, lhs.c_str(), rhs.c_str()); },
+      &auto_metrics);
+  const int scalar_result = run_with_sve_mode<int>(
+      MY_SVE_TEST_MODE_FORCE_SCALAR,
+      [&]() { return cs->coll->strcasecmp(cs, lhs.c_str(), rhs.c_str()); },
+      &scalar_metrics);
+
+  EXPECT_EQ(0, auto_result);
+  EXPECT_EQ(auto_result, scalar_result);
+  EXPECT_EQ(0ULL, scalar_metrics.fast_calls);
+}
+
+TEST(SVEOptimizedCollationScopeTest, Utf8GeneralCiTruncatedInvalidStrcasecmp) {
+  ScopedSVETestMode sve_scope;
+  CHARSET_INFO *cs = find_collation("utf8_general_ci");
+  ASSERT_NE(nullptr, cs);
+
+  const std::string lhs("\xE2", 1);
+  const std::string rhs("\xE3", 1);
+  my_sve_test_metrics auto_metrics = {};
+  my_sve_test_metrics scalar_metrics = {};
+
+  const int auto_result = run_with_sve_mode<int>(
+      MY_SVE_TEST_MODE_AUTO,
+      [&]() { return cs->coll->strcasecmp(cs, lhs.c_str(), rhs.c_str()); },
+      &auto_metrics);
+  const int scalar_result = run_with_sve_mode<int>(
+      MY_SVE_TEST_MODE_FORCE_SCALAR,
+      [&]() { return cs->coll->strcasecmp(cs, lhs.c_str(), rhs.c_str()); },
+      &scalar_metrics);
+
+  EXPECT_EQ(signum(strcmp(lhs.c_str(), rhs.c_str())), signum(auto_result));
+  EXPECT_EQ(auto_result, scalar_result);
+  EXPECT_EQ(0ULL, auto_metrics.fast_calls);
+  EXPECT_EQ(0ULL, scalar_metrics.fast_calls);
+}
+
+TEST(SVEOptimizedCollationScopeTest, Utf8UnicodeCiAsciiHashSort) {
+  ScopedSVETestMode sve_scope;
+  CHARSET_INFO *cs = find_collation("utf8_unicode_ci");
+  ASSERT_NE(nullptr, cs);
+
+  const size_t repeat = std::max<size_t>(1, sve_test_lane_bytes() / 4);
+  std::string src;
+  for (size_t i = 0; i < repeat * 2; ++i) src += "AbCd";
+
+  my_sve_test_metrics auto_metrics = {};
+  my_sve_test_metrics scalar_metrics = {};
+  const HashSortResult auto_result = run_with_sve_mode<HashSortResult>(
+      MY_SVE_TEST_MODE_AUTO, [&]() { return run_hash_sort(cs, src); },
+      &auto_metrics);
+  const HashSortResult scalar_result = run_with_sve_mode<HashSortResult>(
+      MY_SVE_TEST_MODE_FORCE_SCALAR, [&]() { return run_hash_sort(cs, src); },
+      &scalar_metrics);
+
+  EXPECT_EQ(auto_result, scalar_result);
+  EXPECT_EQ(0ULL, scalar_metrics.fast_calls);
+  expect_fast_path_if_available(auto_metrics);
+}
+
+TEST(SVEOptimizedCollationScopeTest, Utf8mb4SpanishCiDoesNotUseLegacyUcaFastPath) {
+  ScopedSVETestMode sve_scope;
+  CHARSET_INFO *cs = find_collation("utf8mb4_spanish_ci");
+  ASSERT_NE(nullptr, cs);
+
+  const size_t repeat = std::max<size_t>(1, sve_test_lane_bytes() / 4);
+  std::string src;
+  for (size_t i = 0; i < repeat * 2; ++i) src += "AbCd";
+
+  my_sve_test_metrics auto_metrics = {};
+  my_sve_test_metrics scalar_metrics = {};
+  const HashSortResult auto_result = run_with_sve_mode<HashSortResult>(
+      MY_SVE_TEST_MODE_AUTO, [&]() { return run_hash_sort(cs, src); },
+      &auto_metrics);
+  const HashSortResult scalar_result = run_with_sve_mode<HashSortResult>(
+      MY_SVE_TEST_MODE_FORCE_SCALAR, [&]() { return run_hash_sort(cs, src); },
+      &scalar_metrics);
+
+  EXPECT_EQ(auto_result, scalar_result);
+  EXPECT_EQ(0ULL, auto_metrics.fast_calls);
+  EXPECT_EQ(0ULL, scalar_metrics.fast_calls);
+}
+
+TEST(SVEOptimizedCollationScopeTest, Utf8mb4GeneralCiExactLaneStrnncoll) {
+  ScopedSVETestMode sve_scope;
+  CHARSET_INFO *cs = find_collation("utf8mb4_general_ci");
+  ASSERT_NE(nullptr, cs);
+
+  const size_t lane = sve_test_lane_bytes();
+  std::string lhs(lane, 'a');
+  std::string rhs(lane, 'A');
+  my_sve_test_metrics auto_metrics = {};
+  my_sve_test_metrics scalar_metrics = {};
+
+  const int auto_result = run_with_sve_mode<int>(
+      MY_SVE_TEST_MODE_AUTO,
+      [&]() {
+        return cs->coll->strnncoll(cs, pointer_cast<const uchar *>(lhs.data()),
+                                   lhs.size(),
+                                   pointer_cast<const uchar *>(rhs.data()),
+                                   rhs.size(), false);
+      },
+      &auto_metrics);
+  const int scalar_result = run_with_sve_mode<int>(
+      MY_SVE_TEST_MODE_FORCE_SCALAR,
+      [&]() {
+        return cs->coll->strnncoll(cs, pointer_cast<const uchar *>(lhs.data()),
+                                   lhs.size(),
+                                   pointer_cast<const uchar *>(rhs.data()),
+                                   rhs.size(), false);
+      },
+      &scalar_metrics);
+
+  EXPECT_EQ(0, auto_result);
+  EXPECT_EQ(auto_result, scalar_result);
+  EXPECT_EQ(0ULL, scalar_metrics.fast_calls);
+  if (my_sve_test_runtime_available()) {
+    EXPECT_EQ(0ULL, auto_metrics.tail_bytes);
+  }
+  expect_fast_path_if_available(auto_metrics);
+}
+
+TEST(SVEOptimizedCollationScopeTest, Utf8GeneralCiStrnncollspDualSpaceSkip) {
+  ScopedSVETestMode sve_scope;
+  CHARSET_INFO *cs = find_collation("utf8_general_ci");
+  ASSERT_NE(nullptr, cs);
+
+  const size_t lane = sve_test_lane_bytes();
+  const std::string spaces(lane * 3 + 5, ' ');
+  const std::string lhs = "a" + spaces + "b";
+  const std::string rhs = "A" + spaces + "B";
+  my_sve_test_metrics auto_metrics = {};
+  my_sve_test_metrics scalar_metrics = {};
+
+  const int auto_result = run_with_sve_mode<int>(
+      MY_SVE_TEST_MODE_AUTO, [&]() { return run_strnncollsp(cs, lhs, rhs); },
+      &auto_metrics);
+  const int scalar_result = run_with_sve_mode<int>(
+      MY_SVE_TEST_MODE_FORCE_SCALAR,
+      [&]() { return run_strnncollsp(cs, lhs, rhs); }, &scalar_metrics);
+
+  EXPECT_EQ(0, auto_result);
+  EXPECT_EQ(auto_result, scalar_result);
+  EXPECT_EQ(0ULL, scalar_metrics.fast_calls);
+}
+
+TEST(SVEOptimizedCollationScopeTest, Utf8mb4GeneralCiStrnncollspDualSpaceSkip) {
+  ScopedSVETestMode sve_scope;
+  CHARSET_INFO *cs = find_collation("utf8mb4_general_ci");
+  ASSERT_NE(nullptr, cs);
+
+  const size_t lane = sve_test_lane_bytes();
+  const std::string spaces(lane * 3 + 5, ' ');
+  const std::string lhs = "a" + spaces + "b";
+  const std::string rhs = "A" + spaces + "B";
+  my_sve_test_metrics auto_metrics = {};
+  my_sve_test_metrics scalar_metrics = {};
+
+  const int auto_result = run_with_sve_mode<int>(
+      MY_SVE_TEST_MODE_AUTO, [&]() { return run_strnncollsp(cs, lhs, rhs); },
+      &auto_metrics);
+  const int scalar_result = run_with_sve_mode<int>(
+      MY_SVE_TEST_MODE_FORCE_SCALAR,
+      [&]() { return run_strnncollsp(cs, lhs, rhs); }, &scalar_metrics);
+
+  EXPECT_EQ(0, auto_result);
+  EXPECT_EQ(auto_result, scalar_result);
+  EXPECT_EQ(0ULL, scalar_metrics.fast_calls);
+}
+
+TEST(SVEOptimizedCollationScopeTest, Utf8UnicodeCiStrnncollspDualSpaceSkip) {
+  ScopedSVETestMode sve_scope;
+  CHARSET_INFO *cs = find_collation("utf8_unicode_ci");
+  ASSERT_NE(nullptr, cs);
+
+  const size_t lane = sve_test_lane_bytes();
+  const std::string spaces(lane * 3 + 5, ' ');
+  const std::string lhs = "a" + spaces + "b";
+  const std::string rhs = "A" + spaces + "B";
+  my_sve_test_metrics auto_metrics = {};
+  my_sve_test_metrics scalar_metrics = {};
+
+  const int auto_result = run_with_sve_mode<int>(
+      MY_SVE_TEST_MODE_AUTO, [&]() { return run_strnncollsp(cs, lhs, rhs); },
+      &auto_metrics);
+  const int scalar_result = run_with_sve_mode<int>(
+      MY_SVE_TEST_MODE_FORCE_SCALAR,
+      [&]() { return run_strnncollsp(cs, lhs, rhs); }, &scalar_metrics);
+
+  EXPECT_EQ(0, auto_result);
+  EXPECT_EQ(auto_result, scalar_result);
+  EXPECT_EQ(0ULL, scalar_metrics.fast_calls);
+}
+
+TEST(SVEOptimizedCollationScopeTest, Utf8mb4UnicodeCiStrnncollspDualSpaceSkip) {
+  ScopedSVETestMode sve_scope;
+  CHARSET_INFO *cs = find_collation("utf8mb4_unicode_ci");
+  ASSERT_NE(nullptr, cs);
+
+  const size_t lane = sve_test_lane_bytes();
+  const std::string spaces(lane * 3 + 5, ' ');
+  const std::string lhs = "a" + spaces + "b";
+  const std::string rhs = "A" + spaces + "B";
+  my_sve_test_metrics auto_metrics = {};
+  my_sve_test_metrics scalar_metrics = {};
+
+  const int auto_result = run_with_sve_mode<int>(
+      MY_SVE_TEST_MODE_AUTO, [&]() { return run_strnncollsp(cs, lhs, rhs); },
+      &auto_metrics);
+  const int scalar_result = run_with_sve_mode<int>(
+      MY_SVE_TEST_MODE_FORCE_SCALAR,
+      [&]() { return run_strnncollsp(cs, lhs, rhs); }, &scalar_metrics);
+
+  EXPECT_EQ(0, auto_result);
+  EXPECT_EQ(auto_result, scalar_result);
+  EXPECT_EQ(0ULL, scalar_metrics.fast_calls);
+}
+
+TEST(SVEOptimizedCollationScopeTest, Utf8mb4Uca900StrnncollspDualSpaceSkip) {
+  ScopedSVETestMode sve_scope;
+  CHARSET_INFO *cs = find_collation("utf8mb4_0900_ai_ci");
+  ASSERT_NE(nullptr, cs);
+
+  const size_t lane = sve_test_lane_bytes();
+  const std::string spaces(lane * 3 + 5, ' ');
+  const std::string lhs = "a" + spaces + "b";
+  const std::string rhs = "A" + spaces + "B";
+  my_sve_test_metrics auto_metrics = {};
+  my_sve_test_metrics scalar_metrics = {};
+
+  const int auto_result = run_with_sve_mode<int>(
+      MY_SVE_TEST_MODE_AUTO, [&]() { return run_strnncollsp(cs, lhs, rhs); },
+      &auto_metrics);
+  const int scalar_result = run_with_sve_mode<int>(
+      MY_SVE_TEST_MODE_FORCE_SCALAR,
+      [&]() { return run_strnncollsp(cs, lhs, rhs); }, &scalar_metrics);
+
+  EXPECT_EQ(0, auto_result);
+  EXPECT_EQ(auto_result, scalar_result);
+  EXPECT_EQ(0ULL, scalar_metrics.fast_calls);
+}
+
+TEST(SVEOptimizedCollationScopeTest, Utf8UnicodeCiExactLaneStrnncoll) {
+  ScopedSVETestMode sve_scope;
+  CHARSET_INFO *cs = find_collation("utf8_unicode_ci");
+  ASSERT_NE(nullptr, cs);
+
+  const size_t lane = sve_test_lane_bytes();
+  std::string lhs(lane, 'a');
+  std::string rhs(lane, 'A');
+  my_sve_test_metrics auto_metrics = {};
+  my_sve_test_metrics scalar_metrics = {};
+
+  const int auto_result = run_with_sve_mode<int>(
+      MY_SVE_TEST_MODE_AUTO,
+      [&]() { return run_strnncoll(cs, lhs, rhs, false); },
+      &auto_metrics);
+  const int scalar_result = run_with_sve_mode<int>(
+      MY_SVE_TEST_MODE_FORCE_SCALAR,
+      [&]() { return run_strnncoll(cs, lhs, rhs, false); },
+      &scalar_metrics);
+
+  EXPECT_EQ(0, auto_result);
+  EXPECT_EQ(auto_result, scalar_result);
+  EXPECT_EQ(0ULL, scalar_metrics.fast_calls);
+  if (my_sve_test_runtime_available()) {
+    EXPECT_EQ(0ULL, auto_metrics.tail_bytes);
+  }
+  expect_fast_path_if_available(auto_metrics);
+}
+
+TEST(SVEOptimizedCollationScopeTest, Utf8mb4UnicodeCiExactLaneStrnncoll) {
+  ScopedSVETestMode sve_scope;
+  CHARSET_INFO *cs = find_collation("utf8mb4_unicode_ci");
+  ASSERT_NE(nullptr, cs);
+
+  const size_t lane = sve_test_lane_bytes();
+  std::string lhs(lane, 'z');
+  std::string rhs(lane, 'Z');
+  my_sve_test_metrics auto_metrics = {};
+  my_sve_test_metrics scalar_metrics = {};
+
+  const int auto_result = run_with_sve_mode<int>(
+      MY_SVE_TEST_MODE_AUTO,
+      [&]() { return run_strnncoll(cs, lhs, rhs, false); },
+      &auto_metrics);
+  const int scalar_result = run_with_sve_mode<int>(
+      MY_SVE_TEST_MODE_FORCE_SCALAR,
+      [&]() { return run_strnncoll(cs, lhs, rhs, false); },
+      &scalar_metrics);
+
+  EXPECT_EQ(0, auto_result);
+  EXPECT_EQ(auto_result, scalar_result);
+  EXPECT_EQ(0ULL, scalar_metrics.fast_calls);
+  if (my_sve_test_runtime_available()) {
+    EXPECT_EQ(0ULL, auto_metrics.tail_bytes);
+  }
+  expect_fast_path_if_available(auto_metrics);
+}
+
+TEST(SVEOptimizedCollationScopeTest, Utf8mb4UnicodeCiAsciiDifferenceStrnncoll) {
+  ScopedSVETestMode sve_scope;
+  CHARSET_INFO *cs = find_collation("utf8mb4_unicode_ci");
+  ASSERT_NE(nullptr, cs);
+
+  const size_t lane = sve_test_lane_bytes();
+  std::string lhs(lane, 'a');
+  std::string rhs(lane, 'a');
+  rhs[lane / 2] = 'b';
+  my_sve_test_metrics auto_metrics = {};
+  my_sve_test_metrics scalar_metrics = {};
+
+  const int auto_result = run_with_sve_mode<int>(
+      MY_SVE_TEST_MODE_AUTO,
+      [&]() { return run_strnncoll(cs, lhs, rhs, false); },
+      &auto_metrics);
+  const int scalar_result = run_with_sve_mode<int>(
+      MY_SVE_TEST_MODE_FORCE_SCALAR,
+      [&]() { return run_strnncoll(cs, lhs, rhs, false); },
+      &scalar_metrics);
+
+  EXPECT_EQ(signum(scalar_result), signum(auto_result));
+  EXPECT_NE(0, auto_result);
+  EXPECT_EQ(0ULL, scalar_metrics.fast_calls);
+  expect_fast_path_if_available(auto_metrics);
+}
+
+TEST(SVEOptimizedCollationScopeTest, Utf8mb4UnicodeCiPrefixCompareUsesScalar) {
+  ScopedSVETestMode sve_scope;
+  CHARSET_INFO *cs = find_collation("utf8mb4_unicode_ci");
+  ASSERT_NE(nullptr, cs);
+
+  const size_t lane = sve_test_lane_bytes();
+  std::string lhs(lane * 2, 'a');
+  std::string rhs(lane, 'A');
+  my_sve_test_metrics auto_metrics = {};
+  my_sve_test_metrics scalar_metrics = {};
+
+  const int auto_result = run_with_sve_mode<int>(
+      MY_SVE_TEST_MODE_AUTO,
+      [&]() { return run_strnncoll(cs, lhs, rhs, true); },
+      &auto_metrics);
+  const int scalar_result = run_with_sve_mode<int>(
+      MY_SVE_TEST_MODE_FORCE_SCALAR,
+      [&]() { return run_strnncoll(cs, lhs, rhs, true); },
+      &scalar_metrics);
+
+  EXPECT_EQ(0, auto_result);
+  EXPECT_EQ(auto_result, scalar_result);
+  EXPECT_EQ(0ULL, auto_metrics.fast_calls);
+  EXPECT_EQ(0ULL, scalar_metrics.fast_calls);
+}
+
+TEST(SVEOptimizedCollationScopeTest, Utf8mb4Uca900ExactLaneStrnncoll) {
+  ScopedSVETestMode sve_scope;
+  CHARSET_INFO *cs = find_collation("utf8mb4_0900_ai_ci");
+  ASSERT_NE(nullptr, cs);
+
+  const size_t lane = sve_test_lane_bytes();
+  std::string lhs(lane, 'a');
+  std::string rhs(lane, 'A');
+  my_sve_test_metrics auto_metrics = {};
+  my_sve_test_metrics scalar_metrics = {};
+
+  const int auto_result = run_with_sve_mode<int>(
+      MY_SVE_TEST_MODE_AUTO,
+      [&]() { return run_strnncoll(cs, lhs, rhs, false); },
+      &auto_metrics);
+  const int scalar_result = run_with_sve_mode<int>(
+      MY_SVE_TEST_MODE_FORCE_SCALAR,
+      [&]() { return run_strnncoll(cs, lhs, rhs, false); },
+      &scalar_metrics);
+
+  EXPECT_EQ(0, auto_result);
+  EXPECT_EQ(auto_result, scalar_result);
+  EXPECT_EQ(0ULL, scalar_metrics.fast_calls);
+  if (my_sve_test_runtime_available()) {
+    EXPECT_EQ(0ULL, auto_metrics.tail_bytes);
+  }
+  expect_fast_path_if_available(auto_metrics);
+}
+
+TEST(SVEOptimizedCollationScopeTest, Utf8mb4Uca900AsciiDifferenceStrnncoll) {
+  ScopedSVETestMode sve_scope;
+  CHARSET_INFO *cs = find_collation("utf8mb4_0900_ai_ci");
+  ASSERT_NE(nullptr, cs);
+
+  const size_t lane = sve_test_lane_bytes();
+  std::string lhs(lane, 'a');
+  std::string rhs(lane, 'a');
+  rhs[lane / 2] = 'b';
+  my_sve_test_metrics auto_metrics = {};
+  my_sve_test_metrics scalar_metrics = {};
+
+  const int auto_result = run_with_sve_mode<int>(
+      MY_SVE_TEST_MODE_AUTO,
+      [&]() { return run_strnncoll(cs, lhs, rhs, false); },
+      &auto_metrics);
+  const int scalar_result = run_with_sve_mode<int>(
+      MY_SVE_TEST_MODE_FORCE_SCALAR,
+      [&]() { return run_strnncoll(cs, lhs, rhs, false); },
+      &scalar_metrics);
+
+  EXPECT_EQ(signum(scalar_result), signum(auto_result));
+  EXPECT_NE(0, auto_result);
+  EXPECT_EQ(0ULL, scalar_metrics.fast_calls);
+  expect_fast_path_if_available(auto_metrics);
+}
+
+TEST(SVEOptimizedCollationScopeTest, Utf8mb4Uca900PrefixCompareUsesScalar) {
+  ScopedSVETestMode sve_scope;
+  CHARSET_INFO *cs = find_collation("utf8mb4_0900_ai_ci");
+  ASSERT_NE(nullptr, cs);
+
+  const size_t lane = sve_test_lane_bytes();
+  std::string lhs(lane * 2, 'a');
+  std::string rhs(lane, 'A');
+  my_sve_test_metrics auto_metrics = {};
+  my_sve_test_metrics scalar_metrics = {};
+
+  const int auto_result = run_with_sve_mode<int>(
+      MY_SVE_TEST_MODE_AUTO,
+      [&]() { return run_strnncoll(cs, lhs, rhs, true); },
+      &auto_metrics);
+  const int scalar_result = run_with_sve_mode<int>(
+      MY_SVE_TEST_MODE_FORCE_SCALAR,
+      [&]() { return run_strnncoll(cs, lhs, rhs, true); },
+      &scalar_metrics);
+
+  EXPECT_EQ(0, auto_result);
+  EXPECT_EQ(auto_result, scalar_result);
+  EXPECT_EQ(0ULL, auto_metrics.fast_calls);
+  EXPECT_EQ(0ULL, scalar_metrics.fast_calls);
+}
+
+TEST(SVEOptimizedCollationScopeTest, Utf8mb4Uca900AsciiHashSort) {
+  ScopedSVETestMode sve_scope;
+  CHARSET_INFO *cs = find_collation("utf8mb4_0900_ai_ci");
+  ASSERT_NE(nullptr, cs);
+
+  const size_t repeat = std::max<size_t>(1, sve_test_lane_bytes() / 4);
+  std::string src;
+  for (size_t i = 0; i < repeat * 2; ++i) src += "AbCd";
+  my_sve_test_metrics auto_metrics = {};
+  my_sve_test_metrics scalar_metrics = {};
+
+  const HashSortResult auto_result = run_with_sve_mode<HashSortResult>(
+      MY_SVE_TEST_MODE_AUTO, [&]() { return run_hash_sort(cs, src); },
+      &auto_metrics);
+  const HashSortResult scalar_result = run_with_sve_mode<HashSortResult>(
+      MY_SVE_TEST_MODE_FORCE_SCALAR, [&]() { return run_hash_sort(cs, src); },
+      &scalar_metrics);
+
+  EXPECT_EQ(auto_result, scalar_result);
+  EXPECT_EQ(0ULL, scalar_metrics.fast_calls);
+  expect_fast_path_if_available(auto_metrics);
+}
+
+TEST(SVEOptimizedCollationScopeTest, Utf8mb4Uca900AsciiCaseConversion) {
+  ScopedSVETestMode sve_scope;
+  CHARSET_INFO *cs = find_collation("utf8mb4_0900_ai_ci");
+  ASSERT_NE(nullptr, cs);
+
+  const size_t repeat = std::max<size_t>(1, sve_test_lane_bytes() / 4);
+  std::string upper_src;
+  std::string lower_src;
+  for (size_t i = 0; i < repeat * 2; ++i) {
+    upper_src += "abCd";
+    lower_src += "ABcD";
+  }
+  my_sve_test_metrics up_auto_metrics = {};
+  my_sve_test_metrics up_scalar_metrics = {};
+  my_sve_test_metrics dn_auto_metrics = {};
+  my_sve_test_metrics dn_scalar_metrics = {};
+
+  const std::string up_auto = run_with_sve_mode<std::string>(
+      MY_SVE_TEST_MODE_AUTO, [&]() { return run_caseup(cs, upper_src); },
+      &up_auto_metrics);
+  const std::string up_scalar = run_with_sve_mode<std::string>(
+      MY_SVE_TEST_MODE_FORCE_SCALAR,
+      [&]() { return run_caseup(cs, upper_src); }, &up_scalar_metrics);
+  const std::string dn_auto = run_with_sve_mode<std::string>(
+      MY_SVE_TEST_MODE_AUTO, [&]() { return run_casedn(cs, lower_src); },
+      &dn_auto_metrics);
+  const std::string dn_scalar = run_with_sve_mode<std::string>(
+      MY_SVE_TEST_MODE_FORCE_SCALAR,
+      [&]() { return run_casedn(cs, lower_src); }, &dn_scalar_metrics);
+
+  EXPECT_EQ(up_auto, up_scalar);
+  EXPECT_EQ(dn_auto, dn_scalar);
+  EXPECT_EQ(0ULL, up_scalar_metrics.fast_calls);
+  EXPECT_EQ(0ULL, dn_scalar_metrics.fast_calls);
+  expect_fast_path_if_available(up_auto_metrics);
+  expect_fast_path_if_available(dn_auto_metrics);
+}
+
+TEST(SVEOptimizedCollationScopeTest, Utf8GeneralCiTruncatedInvalidCaseConversion) {
+  ScopedSVETestMode sve_scope;
+  CHARSET_INFO *cs = find_collation("utf8_general_ci");
+  ASSERT_NE(nullptr, cs);
+
+  const std::string src("\xE2", 1);
+  my_sve_test_metrics up_auto_metrics = {};
+  my_sve_test_metrics up_scalar_metrics = {};
+  my_sve_test_metrics dn_auto_metrics = {};
+  my_sve_test_metrics dn_scalar_metrics = {};
+
+  const std::string up_auto = run_with_sve_mode<std::string>(
+      MY_SVE_TEST_MODE_AUTO, [&]() { return run_caseup(cs, src); },
+      &up_auto_metrics);
+  const std::string up_scalar = run_with_sve_mode<std::string>(
+      MY_SVE_TEST_MODE_FORCE_SCALAR,
+      [&]() { return run_caseup(cs, src); }, &up_scalar_metrics);
+  const std::string dn_auto = run_with_sve_mode<std::string>(
+      MY_SVE_TEST_MODE_AUTO, [&]() { return run_casedn(cs, src); },
+      &dn_auto_metrics);
+  const std::string dn_scalar = run_with_sve_mode<std::string>(
+      MY_SVE_TEST_MODE_FORCE_SCALAR,
+      [&]() { return run_casedn(cs, src); }, &dn_scalar_metrics);
+
+  EXPECT_EQ(std::string(), up_auto);
+  EXPECT_EQ(up_auto, up_scalar);
+  EXPECT_EQ(std::string(), dn_auto);
+  EXPECT_EQ(dn_auto, dn_scalar);
+  EXPECT_EQ(0ULL, up_auto_metrics.fast_calls);
+  EXPECT_EQ(0ULL, up_scalar_metrics.fast_calls);
+  EXPECT_EQ(0ULL, dn_auto_metrics.fast_calls);
+  EXPECT_EQ(0ULL, dn_scalar_metrics.fast_calls);
+}
+
+TEST(SVEOptimizedCollationScopeTest, Utf8mb4GeneralCiTruncatedInvalidCaseConversion) {
+  ScopedSVETestMode sve_scope;
+  CHARSET_INFO *cs = find_collation("utf8mb4_general_ci");
+  ASSERT_NE(nullptr, cs);
+
+  const std::string src("\xF0", 1);
+  my_sve_test_metrics up_auto_metrics = {};
+  my_sve_test_metrics up_scalar_metrics = {};
+  my_sve_test_metrics dn_auto_metrics = {};
+  my_sve_test_metrics dn_scalar_metrics = {};
+
+  const std::string up_auto = run_with_sve_mode<std::string>(
+      MY_SVE_TEST_MODE_AUTO, [&]() { return run_caseup(cs, src); },
+      &up_auto_metrics);
+  const std::string up_scalar = run_with_sve_mode<std::string>(
+      MY_SVE_TEST_MODE_FORCE_SCALAR,
+      [&]() { return run_caseup(cs, src); }, &up_scalar_metrics);
+  const std::string dn_auto = run_with_sve_mode<std::string>(
+      MY_SVE_TEST_MODE_AUTO, [&]() { return run_casedn(cs, src); },
+      &dn_auto_metrics);
+  const std::string dn_scalar = run_with_sve_mode<std::string>(
+      MY_SVE_TEST_MODE_FORCE_SCALAR,
+      [&]() { return run_casedn(cs, src); }, &dn_scalar_metrics);
+
+  EXPECT_EQ(std::string(), up_auto);
+  EXPECT_EQ(up_auto, up_scalar);
+  EXPECT_EQ(std::string(), dn_auto);
+  EXPECT_EQ(dn_auto, dn_scalar);
+  EXPECT_EQ(0ULL, up_auto_metrics.fast_calls);
+  EXPECT_EQ(0ULL, up_scalar_metrics.fast_calls);
+  EXPECT_EQ(0ULL, dn_auto_metrics.fast_calls);
+  EXPECT_EQ(0ULL, dn_scalar_metrics.fast_calls);
+}
+
+TEST(SVEOptimizedCollationScopeTest, Utf8mb4GeneralCiTruncatedInvalidStrcasecmp) {
+  ScopedSVETestMode sve_scope;
+  CHARSET_INFO *cs = find_collation("utf8mb4_general_ci");
+  ASSERT_NE(nullptr, cs);
+
+  const std::string lhs("\xF0", 1);
+  const std::string rhs("\xF1", 1);
+  my_sve_test_metrics auto_metrics = {};
+  my_sve_test_metrics scalar_metrics = {};
+
+  const int auto_result = run_with_sve_mode<int>(
+      MY_SVE_TEST_MODE_AUTO,
+      [&]() { return cs->coll->strcasecmp(cs, lhs.c_str(), rhs.c_str()); },
+      &auto_metrics);
+  const int scalar_result = run_with_sve_mode<int>(
+      MY_SVE_TEST_MODE_FORCE_SCALAR,
+      [&]() { return cs->coll->strcasecmp(cs, lhs.c_str(), rhs.c_str()); },
+      &scalar_metrics);
+
+  EXPECT_EQ(signum(strcmp(lhs.c_str(), rhs.c_str())), signum(auto_result));
+  EXPECT_EQ(auto_result, scalar_result);
+  EXPECT_EQ(0ULL, auto_metrics.fast_calls);
+  EXPECT_EQ(0ULL, scalar_metrics.fast_calls);
+}
+
+TEST(SVEOptimizedCollationScopeTest, Utf8mb4UnicodeCiExactLaneStrnxfrm) {
+  ScopedSVETestMode sve_scope;
+  CHARSET_INFO *cs = find_collation("utf8mb4_unicode_ci");
+  ASSERT_NE(nullptr, cs);
+
+  const size_t repeat = std::max<size_t>(1, sve_test_lane_bytes() / 4);
+  std::string src;
+  for (size_t i = 0; i < repeat; ++i) src += "AbCd";
+
+  my_sve_test_metrics auto_metrics = {};
+  my_sve_test_metrics scalar_metrics = {};
+  const StrnxfrmResult auto_result = run_with_sve_mode<StrnxfrmResult>(
+      MY_SVE_TEST_MODE_AUTO, [&]() { return run_strnxfrm(cs, src, src.size() * 2, 0); },
+      &auto_metrics);
+  const StrnxfrmResult scalar_result = run_with_sve_mode<StrnxfrmResult>(
+      MY_SVE_TEST_MODE_FORCE_SCALAR,
+      [&]() { return run_strnxfrm(cs, src, src.size() * 2, 0); },
+      &scalar_metrics);
+
+  EXPECT_EQ(auto_result, scalar_result);
+  EXPECT_EQ(0ULL, scalar_metrics.fast_calls);
+  if (my_sve_test_runtime_available()) {
+    EXPECT_EQ(0ULL, auto_metrics.tail_bytes);
+  }
+  expect_fast_path_if_available(auto_metrics);
+}
+
+TEST(SVEOptimizedCollationScopeTest, Utf8mb4Uca900ExactLaneStrnxfrm) {
+  ScopedSVETestMode sve_scope;
+  CHARSET_INFO *cs = find_collation("utf8mb4_0900_ai_ci");
+  ASSERT_NE(nullptr, cs);
+
+  const size_t repeat = std::max<size_t>(1, sve_test_lane_bytes() / 4);
+  std::string src;
+  for (size_t i = 0; i < repeat; ++i) src += "AbCd";
+
+  my_sve_test_metrics auto_metrics = {};
+  my_sve_test_metrics scalar_metrics = {};
+  const StrnxfrmResult auto_result = run_with_sve_mode<StrnxfrmResult>(
+      MY_SVE_TEST_MODE_AUTO, [&]() { return run_strnxfrm(cs, src, src.size() * 2, 0); },
+      &auto_metrics);
+  const StrnxfrmResult scalar_result = run_with_sve_mode<StrnxfrmResult>(
+      MY_SVE_TEST_MODE_FORCE_SCALAR,
+      [&]() { return run_strnxfrm(cs, src, src.size() * 2, 0); },
+      &scalar_metrics);
+
+  EXPECT_EQ(auto_result, scalar_result);
+  EXPECT_EQ(0ULL, scalar_metrics.fast_calls);
+  EXPECT_EQ(0ULL, auto_metrics.fast_calls);
+}
+
+TEST(SVEOptimizedCollationScopeTest, Utf80900AiCiIsUnavailable) {
+  EXPECT_EQ(nullptr, find_collation("utf8_0900_ai_ci"));
+}
+
+#endif  // defined(HAVE_SVE_ACLE)
 
 static bool test_well_formed_copy_nchars(const CHARSET_INFO *to_cs,
                                          const CHARSET_INFO *from_cs,

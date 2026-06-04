@@ -1,0 +1,405 @@
+--source include/no_valgrind_without_big.inc
+--source include/ctype_utf8mb4_sve_common.inc
+
+let $have_perfschema= `SELECT COUNT(*) FROM information_schema.engines WHERE engine = 'PERFORMANCE_SCHEMA' AND support IN ('YES', 'DEFAULT')`;
+if (!$have_perfschema)
+{
+  UNINSTALL COMPONENT "file://component_test_utf8mb4_sve";
+  skip Requires performance_schema.;
+}
+
+--disable_query_log
+SELECT enabled INTO @save_ps_global
+FROM performance_schema.setup_consumers
+WHERE NAME = 'global_instrumentation';
+SELECT enabled INTO @save_ps_thread
+FROM performance_schema.setup_consumers
+WHERE NAME = 'thread_instrumentation';
+SELECT enabled INTO @save_ps_stmt_current
+FROM performance_schema.setup_consumers
+WHERE NAME = 'events_statements_current';
+SELECT enabled INTO @save_ps_stmt_history_long
+FROM performance_schema.setup_consumers
+WHERE NAME = 'events_statements_history_long';
+
+UPDATE performance_schema.setup_consumers
+SET enabled = 'YES'
+WHERE NAME IN ('global_instrumentation',
+               'thread_instrumentation',
+               'events_statements_current',
+               'events_statements_history_long');
+--enable_query_log
+
+let $sve_sql_charset= utf8mb4;
+let $sve_sql_mem_collation= utf8mb4_unicode_ci;
+let $sve_sql_part_collation= utf8mb4_bin;
+--source include/ctype_utf8mb4_sve_sql.inc
+
+--echo # 用例 11: 验证 my_numchars_mb 处理纯 ASCII 长串时字符数正确，并为性能对比准备数据
+INSERT INTO t_sve_sql(v)
+WITH RECURSIVE seq AS (
+  SELECT 1 AS n
+  UNION ALL
+  SELECT n + 1 FROM seq WHERE n < 256
+)
+SELECT CONCAT('abc', LPAD(n, 5, '0')) FROM seq;
+INSERT INTO t_sve_sql(v)
+SELECT v FROM t_sve_sql;
+INSERT INTO t_sve_sql(v)
+SELECT v FROM t_sve_sql;
+
+SELECT test_sve_numchars('utf8mb4_general_ci', HEX(REPEAT('a', @sve_len_unit * 64))) AS ascii_numchars;
+SELECT test_sve_numchars('utf8_general_ci', HEX(REPEAT('a', @sve_len_unit * 64))) AS ascii_numchars_utf8;
+
+CREATE TEMPORARY TABLE t_sve_perf_numchars (
+  mode VARCHAR(16),
+  timer_ns BIGINT UNSIGNED
+);
+
+CREATE TEMPORARY TABLE t_sve_perf_sql (
+  kind VARCHAR(16),
+  mode VARCHAR(16),
+  timer_wait BIGINT UNSIGNED
+);
+
+SET @thread_id := (SELECT THREAD_ID FROM performance_schema.threads WHERE PROCESSLIST_ID = CONNECTION_ID());
+
+TRUNCATE TABLE performance_schema.events_statements_history_long;
+
+--echo # 用例 11: 对 numchars 微基准分别采集 auto 和 force_scalar 的 5 轮耗时
+SELECT test_sve_mode('auto');
+INSERT INTO t_sve_perf_numchars VALUES
+('auto', test_sve_bench_numchars('utf8mb4_general_ci', HEX(REPEAT('a', @sve_len_unit * 512)), 2000)),
+('auto', test_sve_bench_numchars('utf8mb4_general_ci', HEX(REPEAT('a', @sve_len_unit * 512)), 2000)),
+('auto', test_sve_bench_numchars('utf8mb4_general_ci', HEX(REPEAT('a', @sve_len_unit * 512)), 2000)),
+('auto', test_sve_bench_numchars('utf8mb4_general_ci', HEX(REPEAT('a', @sve_len_unit * 512)), 2000)),
+('auto', test_sve_bench_numchars('utf8mb4_general_ci', HEX(REPEAT('a', @sve_len_unit * 512)), 2000));
+
+SELECT test_sve_mode('force_scalar');
+INSERT INTO t_sve_perf_numchars VALUES
+('force_scalar', test_sve_bench_numchars('utf8mb4_general_ci', HEX(REPEAT('a', @sve_len_unit * 512)), 2000)),
+('force_scalar', test_sve_bench_numchars('utf8mb4_general_ci', HEX(REPEAT('a', @sve_len_unit * 512)), 2000)),
+('force_scalar', test_sve_bench_numchars('utf8mb4_general_ci', HEX(REPEAT('a', @sve_len_unit * 512)), 2000)),
+('force_scalar', test_sve_bench_numchars('utf8mb4_general_ci', HEX(REPEAT('a', @sve_len_unit * 512)), 2000)),
+('force_scalar', test_sve_bench_numchars('utf8mb4_general_ci', HEX(REPEAT('a', @sve_len_unit * 512)), 2000));
+
+SET @numchars_auto_med := (
+  SELECT CAST(SUBSTRING_INDEX(SUBSTRING_INDEX(GROUP_CONCAT(timer_ns ORDER BY timer_ns), ',', 3), ',', -1) AS UNSIGNED)
+  FROM t_sve_perf_numchars WHERE mode='auto'
+);
+SET @numchars_scalar_med := (
+  SELECT CAST(SUBSTRING_INDEX(SUBSTRING_INDEX(GROUP_CONCAT(timer_ns ORDER BY timer_ns), ',', 3), ',', -1) AS UNSIGNED)
+  FROM t_sve_perf_numchars WHERE mode='force_scalar'
+);
+
+if ($sve_available)
+{
+  SELECT @numchars_auto_med > 0 AND @numchars_scalar_med > 0 AS numchars_timing_collected;
+}
+if (!$sve_available)
+{
+  SELECT IF(@numchars_auto_med >= @numchars_scalar_med,
+            @numchars_auto_med - @numchars_scalar_med,
+            @numchars_scalar_med - @numchars_auto_med) <= GREATEST(@numchars_scalar_med * 0.10, 1) AS numchars_fallback_close;
+}
+
+--echo # 用例 26: 对 ORDER BY、GROUP BY、LIKE 'abc%' 的 SQL 场景采集定时并比较 auto 与 force_scalar
+SELECT test_sve_mode('auto');
+SELECT SQL_NO_CACHE COUNT(*) FROM (SELECT v FROM t_sve_sql ORDER BY v COLLATE utf8mb4_general_ci, BINARY v LIMIT 512) AS q;
+INSERT INTO t_sve_perf_sql
+SELECT 'order', 'auto', TIMER_WAIT
+FROM performance_schema.events_statements_history_long
+WHERE THREAD_ID = @thread_id
+  AND SQL_TEXT = "SELECT SQL_NO_CACHE COUNT(*) FROM (SELECT v FROM t_sve_sql ORDER BY v COLLATE utf8mb4_general_ci, BINARY v LIMIT 512) AS q"
+ORDER BY EVENT_ID DESC LIMIT 1;
+SELECT SQL_NO_CACHE COUNT(*) FROM (SELECT v COLLATE utf8mb4_general_ci AS k, COUNT(*) AS c FROM t_sve_sql GROUP BY v COLLATE utf8mb4_general_ci) AS q;
+INSERT INTO t_sve_perf_sql
+SELECT 'group', 'auto', TIMER_WAIT
+FROM performance_schema.events_statements_history_long
+WHERE THREAD_ID = @thread_id
+  AND SQL_TEXT = "SELECT SQL_NO_CACHE COUNT(*) FROM (SELECT v COLLATE utf8mb4_general_ci AS k, COUNT(*) AS c FROM t_sve_sql GROUP BY v COLLATE utf8mb4_general_ci) AS q"
+ORDER BY EVENT_ID DESC LIMIT 1;
+SELECT SQL_NO_CACHE COUNT(*) FROM t_sve_sql WHERE v LIKE 'abc%';
+INSERT INTO t_sve_perf_sql
+SELECT 'like', 'auto', TIMER_WAIT
+FROM performance_schema.events_statements_history_long
+WHERE THREAD_ID = @thread_id
+  AND SQL_TEXT = "SELECT SQL_NO_CACHE COUNT(*) FROM t_sve_sql WHERE v LIKE 'abc%'"
+ORDER BY EVENT_ID DESC LIMIT 1;
+
+SELECT test_sve_mode('auto');
+SELECT SQL_NO_CACHE COUNT(*) FROM (SELECT v FROM t_sve_sql ORDER BY v COLLATE utf8mb4_general_ci, BINARY v LIMIT 512) AS q;
+INSERT INTO t_sve_perf_sql
+SELECT 'order', 'auto', TIMER_WAIT
+FROM performance_schema.events_statements_history_long
+WHERE THREAD_ID = @thread_id
+  AND SQL_TEXT = "SELECT SQL_NO_CACHE COUNT(*) FROM (SELECT v FROM t_sve_sql ORDER BY v COLLATE utf8mb4_general_ci, BINARY v LIMIT 512) AS q"
+ORDER BY EVENT_ID DESC LIMIT 1;
+SELECT SQL_NO_CACHE COUNT(*) FROM (SELECT v COLLATE utf8mb4_general_ci AS k, COUNT(*) AS c FROM t_sve_sql GROUP BY v COLLATE utf8mb4_general_ci) AS q;
+INSERT INTO t_sve_perf_sql
+SELECT 'group', 'auto', TIMER_WAIT
+FROM performance_schema.events_statements_history_long
+WHERE THREAD_ID = @thread_id
+  AND SQL_TEXT = "SELECT SQL_NO_CACHE COUNT(*) FROM (SELECT v COLLATE utf8mb4_general_ci AS k, COUNT(*) AS c FROM t_sve_sql GROUP BY v COLLATE utf8mb4_general_ci) AS q"
+ORDER BY EVENT_ID DESC LIMIT 1;
+SELECT SQL_NO_CACHE COUNT(*) FROM t_sve_sql WHERE v LIKE 'abc%';
+INSERT INTO t_sve_perf_sql
+SELECT 'like', 'auto', TIMER_WAIT
+FROM performance_schema.events_statements_history_long
+WHERE THREAD_ID = @thread_id
+  AND SQL_TEXT = "SELECT SQL_NO_CACHE COUNT(*) FROM t_sve_sql WHERE v LIKE 'abc%'"
+ORDER BY EVENT_ID DESC LIMIT 1;
+
+SELECT test_sve_mode('auto');
+SELECT SQL_NO_CACHE COUNT(*) FROM (SELECT v FROM t_sve_sql ORDER BY v COLLATE utf8mb4_general_ci, BINARY v LIMIT 512) AS q;
+INSERT INTO t_sve_perf_sql
+SELECT 'order', 'auto', TIMER_WAIT
+FROM performance_schema.events_statements_history_long
+WHERE THREAD_ID = @thread_id
+  AND SQL_TEXT = "SELECT SQL_NO_CACHE COUNT(*) FROM (SELECT v FROM t_sve_sql ORDER BY v COLLATE utf8mb4_general_ci, BINARY v LIMIT 512) AS q"
+ORDER BY EVENT_ID DESC LIMIT 1;
+SELECT SQL_NO_CACHE COUNT(*) FROM (SELECT v COLLATE utf8mb4_general_ci AS k, COUNT(*) AS c FROM t_sve_sql GROUP BY v COLLATE utf8mb4_general_ci) AS q;
+INSERT INTO t_sve_perf_sql
+SELECT 'group', 'auto', TIMER_WAIT
+FROM performance_schema.events_statements_history_long
+WHERE THREAD_ID = @thread_id
+  AND SQL_TEXT = "SELECT SQL_NO_CACHE COUNT(*) FROM (SELECT v COLLATE utf8mb4_general_ci AS k, COUNT(*) AS c FROM t_sve_sql GROUP BY v COLLATE utf8mb4_general_ci) AS q"
+ORDER BY EVENT_ID DESC LIMIT 1;
+SELECT SQL_NO_CACHE COUNT(*) FROM t_sve_sql WHERE v LIKE 'abc%';
+INSERT INTO t_sve_perf_sql
+SELECT 'like', 'auto', TIMER_WAIT
+FROM performance_schema.events_statements_history_long
+WHERE THREAD_ID = @thread_id
+  AND SQL_TEXT = "SELECT SQL_NO_CACHE COUNT(*) FROM t_sve_sql WHERE v LIKE 'abc%'"
+ORDER BY EVENT_ID DESC LIMIT 1;
+
+SELECT test_sve_mode('auto');
+SELECT SQL_NO_CACHE COUNT(*) FROM (SELECT v FROM t_sve_sql ORDER BY v COLLATE utf8mb4_general_ci, BINARY v LIMIT 512) AS q;
+INSERT INTO t_sve_perf_sql
+SELECT 'order', 'auto', TIMER_WAIT
+FROM performance_schema.events_statements_history_long
+WHERE THREAD_ID = @thread_id
+  AND SQL_TEXT = "SELECT SQL_NO_CACHE COUNT(*) FROM (SELECT v FROM t_sve_sql ORDER BY v COLLATE utf8mb4_general_ci, BINARY v LIMIT 512) AS q"
+ORDER BY EVENT_ID DESC LIMIT 1;
+SELECT SQL_NO_CACHE COUNT(*) FROM (SELECT v COLLATE utf8mb4_general_ci AS k, COUNT(*) AS c FROM t_sve_sql GROUP BY v COLLATE utf8mb4_general_ci) AS q;
+INSERT INTO t_sve_perf_sql
+SELECT 'group', 'auto', TIMER_WAIT
+FROM performance_schema.events_statements_history_long
+WHERE THREAD_ID = @thread_id
+  AND SQL_TEXT = "SELECT SQL_NO_CACHE COUNT(*) FROM (SELECT v COLLATE utf8mb4_general_ci AS k, COUNT(*) AS c FROM t_sve_sql GROUP BY v COLLATE utf8mb4_general_ci) AS q"
+ORDER BY EVENT_ID DESC LIMIT 1;
+SELECT SQL_NO_CACHE COUNT(*) FROM t_sve_sql WHERE v LIKE 'abc%';
+INSERT INTO t_sve_perf_sql
+SELECT 'like', 'auto', TIMER_WAIT
+FROM performance_schema.events_statements_history_long
+WHERE THREAD_ID = @thread_id
+  AND SQL_TEXT = "SELECT SQL_NO_CACHE COUNT(*) FROM t_sve_sql WHERE v LIKE 'abc%'"
+ORDER BY EVENT_ID DESC LIMIT 1;
+
+SELECT test_sve_mode('auto');
+SELECT SQL_NO_CACHE COUNT(*) FROM (SELECT v FROM t_sve_sql ORDER BY v COLLATE utf8mb4_general_ci, BINARY v LIMIT 512) AS q;
+INSERT INTO t_sve_perf_sql
+SELECT 'order', 'auto', TIMER_WAIT
+FROM performance_schema.events_statements_history_long
+WHERE THREAD_ID = @thread_id
+  AND SQL_TEXT = "SELECT SQL_NO_CACHE COUNT(*) FROM (SELECT v FROM t_sve_sql ORDER BY v COLLATE utf8mb4_general_ci, BINARY v LIMIT 512) AS q"
+ORDER BY EVENT_ID DESC LIMIT 1;
+SELECT SQL_NO_CACHE COUNT(*) FROM (SELECT v COLLATE utf8mb4_general_ci AS k, COUNT(*) AS c FROM t_sve_sql GROUP BY v COLLATE utf8mb4_general_ci) AS q;
+INSERT INTO t_sve_perf_sql
+SELECT 'group', 'auto', TIMER_WAIT
+FROM performance_schema.events_statements_history_long
+WHERE THREAD_ID = @thread_id
+  AND SQL_TEXT = "SELECT SQL_NO_CACHE COUNT(*) FROM (SELECT v COLLATE utf8mb4_general_ci AS k, COUNT(*) AS c FROM t_sve_sql GROUP BY v COLLATE utf8mb4_general_ci) AS q"
+ORDER BY EVENT_ID DESC LIMIT 1;
+SELECT SQL_NO_CACHE COUNT(*) FROM t_sve_sql WHERE v LIKE 'abc%';
+INSERT INTO t_sve_perf_sql
+SELECT 'like', 'auto', TIMER_WAIT
+FROM performance_schema.events_statements_history_long
+WHERE THREAD_ID = @thread_id
+  AND SQL_TEXT = "SELECT SQL_NO_CACHE COUNT(*) FROM t_sve_sql WHERE v LIKE 'abc%'"
+ORDER BY EVENT_ID DESC LIMIT 1;
+
+SELECT test_sve_mode('force_scalar');
+SELECT SQL_NO_CACHE COUNT(*) FROM (SELECT v FROM t_sve_sql ORDER BY v COLLATE utf8mb4_general_ci, BINARY v LIMIT 512) AS q;
+INSERT INTO t_sve_perf_sql
+SELECT 'order', 'force_scalar', TIMER_WAIT
+FROM performance_schema.events_statements_history_long
+WHERE THREAD_ID = @thread_id
+  AND SQL_TEXT = "SELECT SQL_NO_CACHE COUNT(*) FROM (SELECT v FROM t_sve_sql ORDER BY v COLLATE utf8mb4_general_ci, BINARY v LIMIT 512) AS q"
+ORDER BY EVENT_ID DESC LIMIT 1;
+SELECT SQL_NO_CACHE COUNT(*) FROM (SELECT v COLLATE utf8mb4_general_ci AS k, COUNT(*) AS c FROM t_sve_sql GROUP BY v COLLATE utf8mb4_general_ci) AS q;
+INSERT INTO t_sve_perf_sql
+SELECT 'group', 'force_scalar', TIMER_WAIT
+FROM performance_schema.events_statements_history_long
+WHERE THREAD_ID = @thread_id
+  AND SQL_TEXT = "SELECT SQL_NO_CACHE COUNT(*) FROM (SELECT v COLLATE utf8mb4_general_ci AS k, COUNT(*) AS c FROM t_sve_sql GROUP BY v COLLATE utf8mb4_general_ci) AS q"
+ORDER BY EVENT_ID DESC LIMIT 1;
+SELECT SQL_NO_CACHE COUNT(*) FROM t_sve_sql WHERE v LIKE 'abc%';
+INSERT INTO t_sve_perf_sql
+SELECT 'like', 'force_scalar', TIMER_WAIT
+FROM performance_schema.events_statements_history_long
+WHERE THREAD_ID = @thread_id
+  AND SQL_TEXT = "SELECT SQL_NO_CACHE COUNT(*) FROM t_sve_sql WHERE v LIKE 'abc%'"
+ORDER BY EVENT_ID DESC LIMIT 1;
+
+SELECT test_sve_mode('force_scalar');
+SELECT SQL_NO_CACHE COUNT(*) FROM (SELECT v FROM t_sve_sql ORDER BY v COLLATE utf8mb4_general_ci, BINARY v LIMIT 512) AS q;
+INSERT INTO t_sve_perf_sql
+SELECT 'order', 'force_scalar', TIMER_WAIT
+FROM performance_schema.events_statements_history_long
+WHERE THREAD_ID = @thread_id
+  AND SQL_TEXT = "SELECT SQL_NO_CACHE COUNT(*) FROM (SELECT v FROM t_sve_sql ORDER BY v COLLATE utf8mb4_general_ci, BINARY v LIMIT 512) AS q"
+ORDER BY EVENT_ID DESC LIMIT 1;
+SELECT SQL_NO_CACHE COUNT(*) FROM (SELECT v COLLATE utf8mb4_general_ci AS k, COUNT(*) AS c FROM t_sve_sql GROUP BY v COLLATE utf8mb4_general_ci) AS q;
+INSERT INTO t_sve_perf_sql
+SELECT 'group', 'force_scalar', TIMER_WAIT
+FROM performance_schema.events_statements_history_long
+WHERE THREAD_ID = @thread_id
+  AND SQL_TEXT = "SELECT SQL_NO_CACHE COUNT(*) FROM (SELECT v COLLATE utf8mb4_general_ci AS k, COUNT(*) AS c FROM t_sve_sql GROUP BY v COLLATE utf8mb4_general_ci) AS q"
+ORDER BY EVENT_ID DESC LIMIT 1;
+SELECT SQL_NO_CACHE COUNT(*) FROM t_sve_sql WHERE v LIKE 'abc%';
+INSERT INTO t_sve_perf_sql
+SELECT 'like', 'force_scalar', TIMER_WAIT
+FROM performance_schema.events_statements_history_long
+WHERE THREAD_ID = @thread_id
+  AND SQL_TEXT = "SELECT SQL_NO_CACHE COUNT(*) FROM t_sve_sql WHERE v LIKE 'abc%'"
+ORDER BY EVENT_ID DESC LIMIT 1;
+
+SELECT test_sve_mode('force_scalar');
+SELECT SQL_NO_CACHE COUNT(*) FROM (SELECT v FROM t_sve_sql ORDER BY v COLLATE utf8mb4_general_ci, BINARY v LIMIT 512) AS q;
+INSERT INTO t_sve_perf_sql
+SELECT 'order', 'force_scalar', TIMER_WAIT
+FROM performance_schema.events_statements_history_long
+WHERE THREAD_ID = @thread_id
+  AND SQL_TEXT = "SELECT SQL_NO_CACHE COUNT(*) FROM (SELECT v FROM t_sve_sql ORDER BY v COLLATE utf8mb4_general_ci, BINARY v LIMIT 512) AS q"
+ORDER BY EVENT_ID DESC LIMIT 1;
+SELECT SQL_NO_CACHE COUNT(*) FROM (SELECT v COLLATE utf8mb4_general_ci AS k, COUNT(*) AS c FROM t_sve_sql GROUP BY v COLLATE utf8mb4_general_ci) AS q;
+INSERT INTO t_sve_perf_sql
+SELECT 'group', 'force_scalar', TIMER_WAIT
+FROM performance_schema.events_statements_history_long
+WHERE THREAD_ID = @thread_id
+  AND SQL_TEXT = "SELECT SQL_NO_CACHE COUNT(*) FROM (SELECT v COLLATE utf8mb4_general_ci AS k, COUNT(*) AS c FROM t_sve_sql GROUP BY v COLLATE utf8mb4_general_ci) AS q"
+ORDER BY EVENT_ID DESC LIMIT 1;
+SELECT SQL_NO_CACHE COUNT(*) FROM t_sve_sql WHERE v LIKE 'abc%';
+INSERT INTO t_sve_perf_sql
+SELECT 'like', 'force_scalar', TIMER_WAIT
+FROM performance_schema.events_statements_history_long
+WHERE THREAD_ID = @thread_id
+  AND SQL_TEXT = "SELECT SQL_NO_CACHE COUNT(*) FROM t_sve_sql WHERE v LIKE 'abc%'"
+ORDER BY EVENT_ID DESC LIMIT 1;
+
+SELECT test_sve_mode('force_scalar');
+SELECT SQL_NO_CACHE COUNT(*) FROM (SELECT v FROM t_sve_sql ORDER BY v COLLATE utf8mb4_general_ci, BINARY v LIMIT 512) AS q;
+INSERT INTO t_sve_perf_sql
+SELECT 'order', 'force_scalar', TIMER_WAIT
+FROM performance_schema.events_statements_history_long
+WHERE THREAD_ID = @thread_id
+  AND SQL_TEXT = "SELECT SQL_NO_CACHE COUNT(*) FROM (SELECT v FROM t_sve_sql ORDER BY v COLLATE utf8mb4_general_ci, BINARY v LIMIT 512) AS q"
+ORDER BY EVENT_ID DESC LIMIT 1;
+SELECT SQL_NO_CACHE COUNT(*) FROM (SELECT v COLLATE utf8mb4_general_ci AS k, COUNT(*) AS c FROM t_sve_sql GROUP BY v COLLATE utf8mb4_general_ci) AS q;
+INSERT INTO t_sve_perf_sql
+SELECT 'group', 'force_scalar', TIMER_WAIT
+FROM performance_schema.events_statements_history_long
+WHERE THREAD_ID = @thread_id
+  AND SQL_TEXT = "SELECT SQL_NO_CACHE COUNT(*) FROM (SELECT v COLLATE utf8mb4_general_ci AS k, COUNT(*) AS c FROM t_sve_sql GROUP BY v COLLATE utf8mb4_general_ci) AS q"
+ORDER BY EVENT_ID DESC LIMIT 1;
+SELECT SQL_NO_CACHE COUNT(*) FROM t_sve_sql WHERE v LIKE 'abc%';
+INSERT INTO t_sve_perf_sql
+SELECT 'like', 'force_scalar', TIMER_WAIT
+FROM performance_schema.events_statements_history_long
+WHERE THREAD_ID = @thread_id
+  AND SQL_TEXT = "SELECT SQL_NO_CACHE COUNT(*) FROM t_sve_sql WHERE v LIKE 'abc%'"
+ORDER BY EVENT_ID DESC LIMIT 1;
+
+SELECT test_sve_mode('force_scalar');
+SELECT SQL_NO_CACHE COUNT(*) FROM (SELECT v FROM t_sve_sql ORDER BY v COLLATE utf8mb4_general_ci, BINARY v LIMIT 512) AS q;
+INSERT INTO t_sve_perf_sql
+SELECT 'order', 'force_scalar', TIMER_WAIT
+FROM performance_schema.events_statements_history_long
+WHERE THREAD_ID = @thread_id
+  AND SQL_TEXT = "SELECT SQL_NO_CACHE COUNT(*) FROM (SELECT v FROM t_sve_sql ORDER BY v COLLATE utf8mb4_general_ci, BINARY v LIMIT 512) AS q"
+ORDER BY EVENT_ID DESC LIMIT 1;
+SELECT SQL_NO_CACHE COUNT(*) FROM (SELECT v COLLATE utf8mb4_general_ci AS k, COUNT(*) AS c FROM t_sve_sql GROUP BY v COLLATE utf8mb4_general_ci) AS q;
+INSERT INTO t_sve_perf_sql
+SELECT 'group', 'force_scalar', TIMER_WAIT
+FROM performance_schema.events_statements_history_long
+WHERE THREAD_ID = @thread_id
+  AND SQL_TEXT = "SELECT SQL_NO_CACHE COUNT(*) FROM (SELECT v COLLATE utf8mb4_general_ci AS k, COUNT(*) AS c FROM t_sve_sql GROUP BY v COLLATE utf8mb4_general_ci) AS q"
+ORDER BY EVENT_ID DESC LIMIT 1;
+SELECT SQL_NO_CACHE COUNT(*) FROM t_sve_sql WHERE v LIKE 'abc%';
+INSERT INTO t_sve_perf_sql
+SELECT 'like', 'force_scalar', TIMER_WAIT
+FROM performance_schema.events_statements_history_long
+WHERE THREAD_ID = @thread_id
+  AND SQL_TEXT = "SELECT SQL_NO_CACHE COUNT(*) FROM t_sve_sql WHERE v LIKE 'abc%'"
+ORDER BY EVENT_ID DESC LIMIT 1;
+
+SET @order_auto_med := (
+  SELECT CAST(SUBSTRING_INDEX(SUBSTRING_INDEX(GROUP_CONCAT(timer_wait ORDER BY timer_wait), ',', 3), ',', -1) AS UNSIGNED)
+  FROM t_sve_perf_sql WHERE kind='order' AND mode='auto'
+);
+SET @order_scalar_med := (
+  SELECT CAST(SUBSTRING_INDEX(SUBSTRING_INDEX(GROUP_CONCAT(timer_wait ORDER BY timer_wait), ',', 3), ',', -1) AS UNSIGNED)
+  FROM t_sve_perf_sql WHERE kind='order' AND mode='force_scalar'
+);
+SET @group_auto_med := (
+  SELECT CAST(SUBSTRING_INDEX(SUBSTRING_INDEX(GROUP_CONCAT(timer_wait ORDER BY timer_wait), ',', 3), ',', -1) AS UNSIGNED)
+  FROM t_sve_perf_sql WHERE kind='group' AND mode='auto'
+);
+SET @group_scalar_med := (
+  SELECT CAST(SUBSTRING_INDEX(SUBSTRING_INDEX(GROUP_CONCAT(timer_wait ORDER BY timer_wait), ',', 3), ',', -1) AS UNSIGNED)
+  FROM t_sve_perf_sql WHERE kind='group' AND mode='force_scalar'
+);
+SET @like_auto_med := (
+  SELECT CAST(SUBSTRING_INDEX(SUBSTRING_INDEX(GROUP_CONCAT(timer_wait ORDER BY timer_wait), ',', 3), ',', -1) AS UNSIGNED)
+  FROM t_sve_perf_sql WHERE kind='like' AND mode='auto'
+);
+SET @like_scalar_med := (
+  SELECT CAST(SUBSTRING_INDEX(SUBSTRING_INDEX(GROUP_CONCAT(timer_wait ORDER BY timer_wait), ',', 3), ',', -1) AS UNSIGNED)
+  FROM t_sve_perf_sql WHERE kind='like' AND mode='force_scalar'
+);
+
+if ($sve_available)
+{
+  SELECT @order_auto_med > 0 AND @order_scalar_med > 0 AS order_timing_collected;
+  SELECT @group_auto_med > 0 AND @group_scalar_med > 0 AS group_timing_collected;
+  SELECT @like_auto_med > 0 AND @like_scalar_med > 0 AS like_timing_collected;
+}
+if (!$sve_available)
+{
+  SELECT IF(@order_auto_med >= @order_scalar_med,
+            @order_auto_med - @order_scalar_med,
+            @order_scalar_med - @order_auto_med) <= GREATEST(@order_scalar_med * 0.10, 1) AS order_fallback_close;
+  SELECT IF(@group_auto_med >= @group_scalar_med,
+            @group_auto_med - @group_scalar_med,
+            @group_scalar_med - @group_auto_med) <= GREATEST(@group_scalar_med * 0.10, 1) AS group_fallback_close;
+  SELECT IF(@like_auto_med >= @like_scalar_med,
+            @like_auto_med - @like_scalar_med,
+            @like_scalar_med - @like_auto_med) <= GREATEST(@like_scalar_med * 0.10, 1) AS like_fallback_close;
+  SELECT CONVERT(test_sve_metrics() USING utf8mb4) LIKE '%fast_calls=0%' AS perf_no_fast;
+}
+
+DROP TEMPORARY TABLE t_sve_perf_numchars;
+DROP TEMPORARY TABLE t_sve_perf_sql;
+
+--disable_query_log
+UPDATE performance_schema.setup_consumers
+SET enabled = @save_ps_global
+WHERE NAME = 'global_instrumentation';
+UPDATE performance_schema.setup_consumers
+SET enabled = @save_ps_thread
+WHERE NAME = 'thread_instrumentation';
+UPDATE performance_schema.setup_consumers
+SET enabled = @save_ps_stmt_current
+WHERE NAME = 'events_statements_current';
+UPDATE performance_schema.setup_consumers
+SET enabled = @save_ps_stmt_history_long
+WHERE NAME = 'events_statements_history_long';
+--enable_query_log
+
+--disable_warnings
+DROP TABLE IF EXISTS t_sve_sql;
+DROP TABLE IF EXISTS t_sve_mem;
+DROP TABLE IF EXISTS t_sve_part;
+UNINSTALL COMPONENT "file://component_test_utf8mb4_sve";
+--enable_warnings

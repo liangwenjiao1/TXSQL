@@ -316,6 +316,17 @@ int my_wildcmp_mb(const CHARSET_INFO *cs, const char *str, const char *str_end,
                             w_many, 1);
 }
 
+#if defined(__aarch64__)
+#define CTYPE_MB
+#if defined(HAVE_SVE_ACLE)
+#include "ctype-sve-opt.cc"
+#else
+#include "ctype-neon-opt.cc"
+#endif
+#undef CTYPE_MB
+#endif
+
+#ifndef CTYPE_MB_OPTIMIZED
 size_t my_numchars_mb(const CHARSET_INFO *cs, const char *pos,
                       const char *end) {
   size_t count = 0;
@@ -338,6 +349,7 @@ size_t my_charpos_mb3(const CHARSET_INFO *cs, const char *pos, const char *end,
   }
   return (size_t)(length ? end + 2 - start : pos - start);
 }
+#endif
 
 size_t my_well_formed_len_mb(const CHARSET_INFO *cs, const char *b,
                              const char *e, size_t pos, int *error) {

@@ -4797,6 +4797,16 @@ static inline void my_tosort_unicode(const MY_UNICASE_INFO *uni_plane,
   }
 }
 
+#if defined(__aarch64__)
+#define CTYPE_UTF8
+#if defined(HAVE_SVE_ACLE)
+#include "ctype-sve-opt.cc"
+#else
+#include "ctype-neon-opt.cc"
+#endif
+#undef CTYPE_UTF8
+#endif
+
 /*
 ** Compare string against string with wildcard
 ** This function is used in UTF8 and UCS2
@@ -4991,6 +5001,7 @@ static size_t my_strxfrm_pad_nweights_unicode(uchar *str, uchar *strend,
   return strend - str0;
 }
 
+#ifndef CTYPE_UTF8_OPTIMIZED
 /**
   Pad buffer with weights for space characters.
 
@@ -5094,6 +5105,7 @@ pad:
     dst += my_strxfrm_pad_unicode(dst, de);
   return dst - dst0;
 }
+#endif
 
 /*
   Store sorting weights using 2 bytes per character.
@@ -5346,6 +5358,7 @@ static inline void my_toupper_utf8mb3(const MY_UNICASE_INFO *uni_plane,
 }
 
 extern "C" {
+#ifndef CTYPE_UTF8_OPTIMIZED
 static size_t my_caseup_utf8mb3(const CHARSET_INFO *cs, char *src,
                                 size_t srclen, char *dst, size_t dstlen) {
   my_wc_t wc;
@@ -5663,6 +5676,7 @@ static int my_strcasecmp_utf8mb3(const CHARSET_INFO *cs, const char *s,
   }
   return ((int)(uchar)s[0]) - ((int)(uchar)t[0]);
 }
+#endif
 
 static int my_wildcmp_utf8mb3(const CHARSET_INFO *cs, const char *str,
                               const char *str_end, const char *wildstr,
@@ -5681,6 +5695,7 @@ static size_t my_strnxfrmlen_utf8mb3(const CHARSET_INFO *cs [[maybe_unused]],
 }  // extern "C"
 
 extern "C" {
+#ifndef CTYPE_UTF8_OPTIMIZED
 static size_t my_well_formed_len_utf8mb3(const CHARSET_INFO *, const char *b,
                                          const char *e, size_t pos,
                                          int *error) {
@@ -5700,6 +5715,7 @@ static size_t my_well_formed_len_utf8mb3(const CHARSET_INFO *, const char *b,
   }
   return (size_t)(b - b_start);
 }
+#endif
 
 static uint my_ismbchar_utf8mb3(const CHARSET_INFO *, const char *b,
                                 const char *e) {
@@ -7295,6 +7311,7 @@ static inline void my_toupper_utf8mb4(const MY_UNICASE_INFO *uni_plane,
 }
 
 extern "C" {
+#ifndef CTYPE_UTF8_OPTIMIZED
 static size_t my_caseup_utf8mb4(const CHARSET_INFO *cs, char *src,
                                 size_t srclen, char *dst, size_t dstlen) {
   my_wc_t wc;
@@ -7547,6 +7564,7 @@ static int my_strnncollsp_utf8mb4(const CHARSET_INFO *cs, const uchar *s,
   }
   return res;
 }
+#endif
 }  // extern "C"
 
 /**
@@ -7563,6 +7581,7 @@ static int my_strnncollsp_utf8mb4(const CHARSET_INFO *cs, const uchar *s,
 */
 
 extern "C" {
+#ifndef CTYPE_UTF8_OPTIMIZED
 static int my_strcasecmp_utf8mb4(const CHARSET_INFO *cs, const char *s,
                                  const char *t) {
   const MY_UNICASE_INFO *uni_plane = cs->caseinfo;
@@ -7609,6 +7628,7 @@ static int my_strcasecmp_utf8mb4(const CHARSET_INFO *cs, const char *s,
   }
   return ((int)(uchar)s[0]) - ((int)(uchar)t[0]);
 }
+#endif
 
 static int my_wildcmp_utf8mb4(const CHARSET_INFO *cs, const char *str,
                               const char *strend, const char *wildstr,
@@ -7635,6 +7655,7 @@ static ALWAYS_INLINE int my_valid_mbcharlen_utf8mb4(const CHARSET_INFO *cs
 }
 
 extern "C" {
+#ifndef CTYPE_UTF8_OPTIMIZED
 static size_t my_well_formed_len_utf8mb4(const CHARSET_INFO *cs, const char *b,
                                          const char *e, size_t pos,
                                          int *error) {
@@ -7654,6 +7675,7 @@ static size_t my_well_formed_len_utf8mb4(const CHARSET_INFO *cs, const char *b,
   }
   return (size_t)(b - b_start);
 }
+#endif
 
 static uint ALWAYS_INLINE my_ismbchar_utf8mb4_inl(const CHARSET_INFO *cs,
                                                   const char *b,

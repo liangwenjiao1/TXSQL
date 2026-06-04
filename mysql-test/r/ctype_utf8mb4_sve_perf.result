@@ -1,0 +1,487 @@
+INSTALL COMPONENT "file://component_test_utf8mb4_sve";
+SET NAMES utf8mb4;
+SET @sve_metrics := test_sve_metrics();
+SET @sve_available := @sve_metrics REGEXP '(^|;)sve_available=1(;|$)';
+SET @sve_instrumented := @sve_metrics REGEXP '(^|;)instrumentation_enabled=1(;|$)';
+SET @sve_metric_checks := @sve_available AND @sve_instrumented;
+SET @sve_lane := CAST(SUBSTRING_INDEX(SUBSTRING_INDEX(@sve_metrics, 'lane_bytes=', -1), ';', 1) AS UNSIGNED);
+SET @sve_len_unit := IF(@sve_lane > 0, @sve_lane, 16);
+test_sve_reset()
+0
+test_sve_mode('auto')
+0
+DROP TABLE IF EXISTS t_sve_sql;
+DROP TABLE IF EXISTS t_sve_mem;
+DROP TABLE IF EXISTS t_sve_part;
+CREATE TABLE t_sve_sql ( id INT PRIMARY KEY AUTO_INCREMENT, v VARCHAR(128) CHARACTER SET utf8mb4 ) ENGINE=InnoDB;
+CREATE TABLE t_sve_mem ( v VARCHAR(128) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci, KEY(v) ) ENGINE=MEMORY;
+CREATE TABLE t_sve_part ( v VARCHAR(32) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin ) PARTITION BY KEY(v) PARTITIONS 4;
+# 用例 11: 验证 my_numchars_mb 处理纯 ASCII 长串时字符数正确，并为性能对比准备数据
+INSERT INTO t_sve_sql(v)
+WITH RECURSIVE seq AS (
+SELECT 1 AS n
+UNION ALL
+SELECT n + 1 FROM seq WHERE n < 256
+)
+SELECT CONCAT('abc', LPAD(n, 5, '0')) FROM seq;
+INSERT INTO t_sve_sql(v)
+SELECT v FROM t_sve_sql;
+INSERT INTO t_sve_sql(v)
+SELECT v FROM t_sve_sql;
+SELECT test_sve_numchars('utf8mb4_general_ci', HEX(REPEAT('a', @sve_len_unit * 64))) AS ascii_numchars;
+ascii_numchars
+2048
+SELECT test_sve_numchars('utf8_general_ci', HEX(REPEAT('a', @sve_len_unit * 64))) AS ascii_numchars_utf8;
+ascii_numchars_utf8
+2048
+CREATE TEMPORARY TABLE t_sve_perf_numchars (
+mode VARCHAR(16),
+timer_ns BIGINT UNSIGNED
+);
+CREATE TEMPORARY TABLE t_sve_perf_sql (
+kind VARCHAR(16),
+mode VARCHAR(16),
+timer_wait BIGINT UNSIGNED
+);
+SET @thread_id := (SELECT THREAD_ID FROM performance_schema.threads WHERE PROCESSLIST_ID = CONNECTION_ID());
+TRUNCATE TABLE performance_schema.events_statements_history_long;
+# 用例 11: 对 numchars 微基准分别采集 auto 和 force_scalar 的 5 轮耗时
+SELECT test_sve_mode('auto');
+test_sve_mode('auto')
+0
+INSERT INTO t_sve_perf_numchars VALUES
+('auto', test_sve_bench_numchars('utf8mb4_general_ci', HEX(REPEAT('a', @sve_len_unit * 512)), 2000)),
+('auto', test_sve_bench_numchars('utf8mb4_general_ci', HEX(REPEAT('a', @sve_len_unit * 512)), 2000)),
+('auto', test_sve_bench_numchars('utf8mb4_general_ci', HEX(REPEAT('a', @sve_len_unit * 512)), 2000)),
+('auto', test_sve_bench_numchars('utf8mb4_general_ci', HEX(REPEAT('a', @sve_len_unit * 512)), 2000)),
+('auto', test_sve_bench_numchars('utf8mb4_general_ci', HEX(REPEAT('a', @sve_len_unit * 512)), 2000));
+SELECT test_sve_mode('force_scalar');
+test_sve_mode('force_scalar')
+1
+INSERT INTO t_sve_perf_numchars VALUES
+('force_scalar', test_sve_bench_numchars('utf8mb4_general_ci', HEX(REPEAT('a', @sve_len_unit * 512)), 2000)),
+('force_scalar', test_sve_bench_numchars('utf8mb4_general_ci', HEX(REPEAT('a', @sve_len_unit * 512)), 2000)),
+('force_scalar', test_sve_bench_numchars('utf8mb4_general_ci', HEX(REPEAT('a', @sve_len_unit * 512)), 2000)),
+('force_scalar', test_sve_bench_numchars('utf8mb4_general_ci', HEX(REPEAT('a', @sve_len_unit * 512)), 2000)),
+('force_scalar', test_sve_bench_numchars('utf8mb4_general_ci', HEX(REPEAT('a', @sve_len_unit * 512)), 2000));
+SET @numchars_auto_med := (
+SELECT CAST(SUBSTRING_INDEX(SUBSTRING_INDEX(GROUP_CONCAT(timer_ns ORDER BY timer_ns), ',', 3), ',', -1) AS UNSIGNED)
+FROM t_sve_perf_numchars WHERE mode='auto'
+);
+SET @numchars_scalar_med := (
+SELECT CAST(SUBSTRING_INDEX(SUBSTRING_INDEX(GROUP_CONCAT(timer_ns ORDER BY timer_ns), ',', 3), ',', -1) AS UNSIGNED)
+FROM t_sve_perf_numchars WHERE mode='force_scalar'
+);
+SELECT @numchars_auto_med > 0 AND @numchars_scalar_med > 0 AS numchars_timing_collected;
+numchars_timing_collected
+1
+# 用例 26: 对 ORDER BY、GROUP BY、LIKE 'abc%' 的 SQL 场景采集定时并比较 auto 与 force_scalar
+SELECT test_sve_mode('auto');
+test_sve_mode('auto')
+0
+SELECT SQL_NO_CACHE COUNT(*) FROM (SELECT v FROM t_sve_sql ORDER BY v COLLATE utf8mb4_general_ci, BINARY v LIMIT 512) AS q;
+COUNT(*)
+512
+Warnings:
+Warning	1681	'SQL_NO_CACHE' is deprecated and will be removed in a future release.
+Warning	1287	'BINARY expr' is deprecated and will be removed in a future release. Please use CAST instead
+INSERT INTO t_sve_perf_sql
+SELECT 'order', 'auto', TIMER_WAIT
+FROM performance_schema.events_statements_history_long
+WHERE THREAD_ID = @thread_id
+AND SQL_TEXT = "SELECT SQL_NO_CACHE COUNT(*) FROM (SELECT v FROM t_sve_sql ORDER BY v COLLATE utf8mb4_general_ci, BINARY v LIMIT 512) AS q"
+ORDER BY EVENT_ID DESC LIMIT 1;
+SELECT SQL_NO_CACHE COUNT(*) FROM (SELECT v COLLATE utf8mb4_general_ci AS k, COUNT(*) AS c FROM t_sve_sql GROUP BY v COLLATE utf8mb4_general_ci) AS q;
+COUNT(*)
+256
+Warnings:
+Warning	1681	'SQL_NO_CACHE' is deprecated and will be removed in a future release.
+INSERT INTO t_sve_perf_sql
+SELECT 'group', 'auto', TIMER_WAIT
+FROM performance_schema.events_statements_history_long
+WHERE THREAD_ID = @thread_id
+AND SQL_TEXT = "SELECT SQL_NO_CACHE COUNT(*) FROM (SELECT v COLLATE utf8mb4_general_ci AS k, COUNT(*) AS c FROM t_sve_sql GROUP BY v COLLATE utf8mb4_general_ci) AS q"
+ORDER BY EVENT_ID DESC LIMIT 1;
+SELECT SQL_NO_CACHE COUNT(*) FROM t_sve_sql WHERE v LIKE 'abc%';
+COUNT(*)
+1024
+Warnings:
+Warning	1681	'SQL_NO_CACHE' is deprecated and will be removed in a future release.
+INSERT INTO t_sve_perf_sql
+SELECT 'like', 'auto', TIMER_WAIT
+FROM performance_schema.events_statements_history_long
+WHERE THREAD_ID = @thread_id
+AND SQL_TEXT = "SELECT SQL_NO_CACHE COUNT(*) FROM t_sve_sql WHERE v LIKE 'abc%'"
+ORDER BY EVENT_ID DESC LIMIT 1;
+SELECT test_sve_mode('auto');
+test_sve_mode('auto')
+0
+SELECT SQL_NO_CACHE COUNT(*) FROM (SELECT v FROM t_sve_sql ORDER BY v COLLATE utf8mb4_general_ci, BINARY v LIMIT 512) AS q;
+COUNT(*)
+512
+Warnings:
+Warning	1681	'SQL_NO_CACHE' is deprecated and will be removed in a future release.
+Warning	1287	'BINARY expr' is deprecated and will be removed in a future release. Please use CAST instead
+INSERT INTO t_sve_perf_sql
+SELECT 'order', 'auto', TIMER_WAIT
+FROM performance_schema.events_statements_history_long
+WHERE THREAD_ID = @thread_id
+AND SQL_TEXT = "SELECT SQL_NO_CACHE COUNT(*) FROM (SELECT v FROM t_sve_sql ORDER BY v COLLATE utf8mb4_general_ci, BINARY v LIMIT 512) AS q"
+ORDER BY EVENT_ID DESC LIMIT 1;
+SELECT SQL_NO_CACHE COUNT(*) FROM (SELECT v COLLATE utf8mb4_general_ci AS k, COUNT(*) AS c FROM t_sve_sql GROUP BY v COLLATE utf8mb4_general_ci) AS q;
+COUNT(*)
+256
+Warnings:
+Warning	1681	'SQL_NO_CACHE' is deprecated and will be removed in a future release.
+INSERT INTO t_sve_perf_sql
+SELECT 'group', 'auto', TIMER_WAIT
+FROM performance_schema.events_statements_history_long
+WHERE THREAD_ID = @thread_id
+AND SQL_TEXT = "SELECT SQL_NO_CACHE COUNT(*) FROM (SELECT v COLLATE utf8mb4_general_ci AS k, COUNT(*) AS c FROM t_sve_sql GROUP BY v COLLATE utf8mb4_general_ci) AS q"
+ORDER BY EVENT_ID DESC LIMIT 1;
+SELECT SQL_NO_CACHE COUNT(*) FROM t_sve_sql WHERE v LIKE 'abc%';
+COUNT(*)
+1024
+Warnings:
+Warning	1681	'SQL_NO_CACHE' is deprecated and will be removed in a future release.
+INSERT INTO t_sve_perf_sql
+SELECT 'like', 'auto', TIMER_WAIT
+FROM performance_schema.events_statements_history_long
+WHERE THREAD_ID = @thread_id
+AND SQL_TEXT = "SELECT SQL_NO_CACHE COUNT(*) FROM t_sve_sql WHERE v LIKE 'abc%'"
+ORDER BY EVENT_ID DESC LIMIT 1;
+SELECT test_sve_mode('auto');
+test_sve_mode('auto')
+0
+SELECT SQL_NO_CACHE COUNT(*) FROM (SELECT v FROM t_sve_sql ORDER BY v COLLATE utf8mb4_general_ci, BINARY v LIMIT 512) AS q;
+COUNT(*)
+512
+Warnings:
+Warning	1681	'SQL_NO_CACHE' is deprecated and will be removed in a future release.
+Warning	1287	'BINARY expr' is deprecated and will be removed in a future release. Please use CAST instead
+INSERT INTO t_sve_perf_sql
+SELECT 'order', 'auto', TIMER_WAIT
+FROM performance_schema.events_statements_history_long
+WHERE THREAD_ID = @thread_id
+AND SQL_TEXT = "SELECT SQL_NO_CACHE COUNT(*) FROM (SELECT v FROM t_sve_sql ORDER BY v COLLATE utf8mb4_general_ci, BINARY v LIMIT 512) AS q"
+ORDER BY EVENT_ID DESC LIMIT 1;
+SELECT SQL_NO_CACHE COUNT(*) FROM (SELECT v COLLATE utf8mb4_general_ci AS k, COUNT(*) AS c FROM t_sve_sql GROUP BY v COLLATE utf8mb4_general_ci) AS q;
+COUNT(*)
+256
+Warnings:
+Warning	1681	'SQL_NO_CACHE' is deprecated and will be removed in a future release.
+INSERT INTO t_sve_perf_sql
+SELECT 'group', 'auto', TIMER_WAIT
+FROM performance_schema.events_statements_history_long
+WHERE THREAD_ID = @thread_id
+AND SQL_TEXT = "SELECT SQL_NO_CACHE COUNT(*) FROM (SELECT v COLLATE utf8mb4_general_ci AS k, COUNT(*) AS c FROM t_sve_sql GROUP BY v COLLATE utf8mb4_general_ci) AS q"
+ORDER BY EVENT_ID DESC LIMIT 1;
+SELECT SQL_NO_CACHE COUNT(*) FROM t_sve_sql WHERE v LIKE 'abc%';
+COUNT(*)
+1024
+Warnings:
+Warning	1681	'SQL_NO_CACHE' is deprecated and will be removed in a future release.
+INSERT INTO t_sve_perf_sql
+SELECT 'like', 'auto', TIMER_WAIT
+FROM performance_schema.events_statements_history_long
+WHERE THREAD_ID = @thread_id
+AND SQL_TEXT = "SELECT SQL_NO_CACHE COUNT(*) FROM t_sve_sql WHERE v LIKE 'abc%'"
+ORDER BY EVENT_ID DESC LIMIT 1;
+SELECT test_sve_mode('auto');
+test_sve_mode('auto')
+0
+SELECT SQL_NO_CACHE COUNT(*) FROM (SELECT v FROM t_sve_sql ORDER BY v COLLATE utf8mb4_general_ci, BINARY v LIMIT 512) AS q;
+COUNT(*)
+512
+Warnings:
+Warning	1681	'SQL_NO_CACHE' is deprecated and will be removed in a future release.
+Warning	1287	'BINARY expr' is deprecated and will be removed in a future release. Please use CAST instead
+INSERT INTO t_sve_perf_sql
+SELECT 'order', 'auto', TIMER_WAIT
+FROM performance_schema.events_statements_history_long
+WHERE THREAD_ID = @thread_id
+AND SQL_TEXT = "SELECT SQL_NO_CACHE COUNT(*) FROM (SELECT v FROM t_sve_sql ORDER BY v COLLATE utf8mb4_general_ci, BINARY v LIMIT 512) AS q"
+ORDER BY EVENT_ID DESC LIMIT 1;
+SELECT SQL_NO_CACHE COUNT(*) FROM (SELECT v COLLATE utf8mb4_general_ci AS k, COUNT(*) AS c FROM t_sve_sql GROUP BY v COLLATE utf8mb4_general_ci) AS q;
+COUNT(*)
+256
+Warnings:
+Warning	1681	'SQL_NO_CACHE' is deprecated and will be removed in a future release.
+INSERT INTO t_sve_perf_sql
+SELECT 'group', 'auto', TIMER_WAIT
+FROM performance_schema.events_statements_history_long
+WHERE THREAD_ID = @thread_id
+AND SQL_TEXT = "SELECT SQL_NO_CACHE COUNT(*) FROM (SELECT v COLLATE utf8mb4_general_ci AS k, COUNT(*) AS c FROM t_sve_sql GROUP BY v COLLATE utf8mb4_general_ci) AS q"
+ORDER BY EVENT_ID DESC LIMIT 1;
+SELECT SQL_NO_CACHE COUNT(*) FROM t_sve_sql WHERE v LIKE 'abc%';
+COUNT(*)
+1024
+Warnings:
+Warning	1681	'SQL_NO_CACHE' is deprecated and will be removed in a future release.
+INSERT INTO t_sve_perf_sql
+SELECT 'like', 'auto', TIMER_WAIT
+FROM performance_schema.events_statements_history_long
+WHERE THREAD_ID = @thread_id
+AND SQL_TEXT = "SELECT SQL_NO_CACHE COUNT(*) FROM t_sve_sql WHERE v LIKE 'abc%'"
+ORDER BY EVENT_ID DESC LIMIT 1;
+SELECT test_sve_mode('auto');
+test_sve_mode('auto')
+0
+SELECT SQL_NO_CACHE COUNT(*) FROM (SELECT v FROM t_sve_sql ORDER BY v COLLATE utf8mb4_general_ci, BINARY v LIMIT 512) AS q;
+COUNT(*)
+512
+Warnings:
+Warning	1681	'SQL_NO_CACHE' is deprecated and will be removed in a future release.
+Warning	1287	'BINARY expr' is deprecated and will be removed in a future release. Please use CAST instead
+INSERT INTO t_sve_perf_sql
+SELECT 'order', 'auto', TIMER_WAIT
+FROM performance_schema.events_statements_history_long
+WHERE THREAD_ID = @thread_id
+AND SQL_TEXT = "SELECT SQL_NO_CACHE COUNT(*) FROM (SELECT v FROM t_sve_sql ORDER BY v COLLATE utf8mb4_general_ci, BINARY v LIMIT 512) AS q"
+ORDER BY EVENT_ID DESC LIMIT 1;
+SELECT SQL_NO_CACHE COUNT(*) FROM (SELECT v COLLATE utf8mb4_general_ci AS k, COUNT(*) AS c FROM t_sve_sql GROUP BY v COLLATE utf8mb4_general_ci) AS q;
+COUNT(*)
+256
+Warnings:
+Warning	1681	'SQL_NO_CACHE' is deprecated and will be removed in a future release.
+INSERT INTO t_sve_perf_sql
+SELECT 'group', 'auto', TIMER_WAIT
+FROM performance_schema.events_statements_history_long
+WHERE THREAD_ID = @thread_id
+AND SQL_TEXT = "SELECT SQL_NO_CACHE COUNT(*) FROM (SELECT v COLLATE utf8mb4_general_ci AS k, COUNT(*) AS c FROM t_sve_sql GROUP BY v COLLATE utf8mb4_general_ci) AS q"
+ORDER BY EVENT_ID DESC LIMIT 1;
+SELECT SQL_NO_CACHE COUNT(*) FROM t_sve_sql WHERE v LIKE 'abc%';
+COUNT(*)
+1024
+Warnings:
+Warning	1681	'SQL_NO_CACHE' is deprecated and will be removed in a future release.
+INSERT INTO t_sve_perf_sql
+SELECT 'like', 'auto', TIMER_WAIT
+FROM performance_schema.events_statements_history_long
+WHERE THREAD_ID = @thread_id
+AND SQL_TEXT = "SELECT SQL_NO_CACHE COUNT(*) FROM t_sve_sql WHERE v LIKE 'abc%'"
+ORDER BY EVENT_ID DESC LIMIT 1;
+SELECT test_sve_mode('force_scalar');
+test_sve_mode('force_scalar')
+1
+SELECT SQL_NO_CACHE COUNT(*) FROM (SELECT v FROM t_sve_sql ORDER BY v COLLATE utf8mb4_general_ci, BINARY v LIMIT 512) AS q;
+COUNT(*)
+512
+Warnings:
+Warning	1681	'SQL_NO_CACHE' is deprecated and will be removed in a future release.
+Warning	1287	'BINARY expr' is deprecated and will be removed in a future release. Please use CAST instead
+INSERT INTO t_sve_perf_sql
+SELECT 'order', 'force_scalar', TIMER_WAIT
+FROM performance_schema.events_statements_history_long
+WHERE THREAD_ID = @thread_id
+AND SQL_TEXT = "SELECT SQL_NO_CACHE COUNT(*) FROM (SELECT v FROM t_sve_sql ORDER BY v COLLATE utf8mb4_general_ci, BINARY v LIMIT 512) AS q"
+ORDER BY EVENT_ID DESC LIMIT 1;
+SELECT SQL_NO_CACHE COUNT(*) FROM (SELECT v COLLATE utf8mb4_general_ci AS k, COUNT(*) AS c FROM t_sve_sql GROUP BY v COLLATE utf8mb4_general_ci) AS q;
+COUNT(*)
+256
+Warnings:
+Warning	1681	'SQL_NO_CACHE' is deprecated and will be removed in a future release.
+INSERT INTO t_sve_perf_sql
+SELECT 'group', 'force_scalar', TIMER_WAIT
+FROM performance_schema.events_statements_history_long
+WHERE THREAD_ID = @thread_id
+AND SQL_TEXT = "SELECT SQL_NO_CACHE COUNT(*) FROM (SELECT v COLLATE utf8mb4_general_ci AS k, COUNT(*) AS c FROM t_sve_sql GROUP BY v COLLATE utf8mb4_general_ci) AS q"
+ORDER BY EVENT_ID DESC LIMIT 1;
+SELECT SQL_NO_CACHE COUNT(*) FROM t_sve_sql WHERE v LIKE 'abc%';
+COUNT(*)
+1024
+Warnings:
+Warning	1681	'SQL_NO_CACHE' is deprecated and will be removed in a future release.
+INSERT INTO t_sve_perf_sql
+SELECT 'like', 'force_scalar', TIMER_WAIT
+FROM performance_schema.events_statements_history_long
+WHERE THREAD_ID = @thread_id
+AND SQL_TEXT = "SELECT SQL_NO_CACHE COUNT(*) FROM t_sve_sql WHERE v LIKE 'abc%'"
+ORDER BY EVENT_ID DESC LIMIT 1;
+SELECT test_sve_mode('force_scalar');
+test_sve_mode('force_scalar')
+1
+SELECT SQL_NO_CACHE COUNT(*) FROM (SELECT v FROM t_sve_sql ORDER BY v COLLATE utf8mb4_general_ci, BINARY v LIMIT 512) AS q;
+COUNT(*)
+512
+Warnings:
+Warning	1681	'SQL_NO_CACHE' is deprecated and will be removed in a future release.
+Warning	1287	'BINARY expr' is deprecated and will be removed in a future release. Please use CAST instead
+INSERT INTO t_sve_perf_sql
+SELECT 'order', 'force_scalar', TIMER_WAIT
+FROM performance_schema.events_statements_history_long
+WHERE THREAD_ID = @thread_id
+AND SQL_TEXT = "SELECT SQL_NO_CACHE COUNT(*) FROM (SELECT v FROM t_sve_sql ORDER BY v COLLATE utf8mb4_general_ci, BINARY v LIMIT 512) AS q"
+ORDER BY EVENT_ID DESC LIMIT 1;
+SELECT SQL_NO_CACHE COUNT(*) FROM (SELECT v COLLATE utf8mb4_general_ci AS k, COUNT(*) AS c FROM t_sve_sql GROUP BY v COLLATE utf8mb4_general_ci) AS q;
+COUNT(*)
+256
+Warnings:
+Warning	1681	'SQL_NO_CACHE' is deprecated and will be removed in a future release.
+INSERT INTO t_sve_perf_sql
+SELECT 'group', 'force_scalar', TIMER_WAIT
+FROM performance_schema.events_statements_history_long
+WHERE THREAD_ID = @thread_id
+AND SQL_TEXT = "SELECT SQL_NO_CACHE COUNT(*) FROM (SELECT v COLLATE utf8mb4_general_ci AS k, COUNT(*) AS c FROM t_sve_sql GROUP BY v COLLATE utf8mb4_general_ci) AS q"
+ORDER BY EVENT_ID DESC LIMIT 1;
+SELECT SQL_NO_CACHE COUNT(*) FROM t_sve_sql WHERE v LIKE 'abc%';
+COUNT(*)
+1024
+Warnings:
+Warning	1681	'SQL_NO_CACHE' is deprecated and will be removed in a future release.
+INSERT INTO t_sve_perf_sql
+SELECT 'like', 'force_scalar', TIMER_WAIT
+FROM performance_schema.events_statements_history_long
+WHERE THREAD_ID = @thread_id
+AND SQL_TEXT = "SELECT SQL_NO_CACHE COUNT(*) FROM t_sve_sql WHERE v LIKE 'abc%'"
+ORDER BY EVENT_ID DESC LIMIT 1;
+SELECT test_sve_mode('force_scalar');
+test_sve_mode('force_scalar')
+1
+SELECT SQL_NO_CACHE COUNT(*) FROM (SELECT v FROM t_sve_sql ORDER BY v COLLATE utf8mb4_general_ci, BINARY v LIMIT 512) AS q;
+COUNT(*)
+512
+Warnings:
+Warning	1681	'SQL_NO_CACHE' is deprecated and will be removed in a future release.
+Warning	1287	'BINARY expr' is deprecated and will be removed in a future release. Please use CAST instead
+INSERT INTO t_sve_perf_sql
+SELECT 'order', 'force_scalar', TIMER_WAIT
+FROM performance_schema.events_statements_history_long
+WHERE THREAD_ID = @thread_id
+AND SQL_TEXT = "SELECT SQL_NO_CACHE COUNT(*) FROM (SELECT v FROM t_sve_sql ORDER BY v COLLATE utf8mb4_general_ci, BINARY v LIMIT 512) AS q"
+ORDER BY EVENT_ID DESC LIMIT 1;
+SELECT SQL_NO_CACHE COUNT(*) FROM (SELECT v COLLATE utf8mb4_general_ci AS k, COUNT(*) AS c FROM t_sve_sql GROUP BY v COLLATE utf8mb4_general_ci) AS q;
+COUNT(*)
+256
+Warnings:
+Warning	1681	'SQL_NO_CACHE' is deprecated and will be removed in a future release.
+INSERT INTO t_sve_perf_sql
+SELECT 'group', 'force_scalar', TIMER_WAIT
+FROM performance_schema.events_statements_history_long
+WHERE THREAD_ID = @thread_id
+AND SQL_TEXT = "SELECT SQL_NO_CACHE COUNT(*) FROM (SELECT v COLLATE utf8mb4_general_ci AS k, COUNT(*) AS c FROM t_sve_sql GROUP BY v COLLATE utf8mb4_general_ci) AS q"
+ORDER BY EVENT_ID DESC LIMIT 1;
+SELECT SQL_NO_CACHE COUNT(*) FROM t_sve_sql WHERE v LIKE 'abc%';
+COUNT(*)
+1024
+Warnings:
+Warning	1681	'SQL_NO_CACHE' is deprecated and will be removed in a future release.
+INSERT INTO t_sve_perf_sql
+SELECT 'like', 'force_scalar', TIMER_WAIT
+FROM performance_schema.events_statements_history_long
+WHERE THREAD_ID = @thread_id
+AND SQL_TEXT = "SELECT SQL_NO_CACHE COUNT(*) FROM t_sve_sql WHERE v LIKE 'abc%'"
+ORDER BY EVENT_ID DESC LIMIT 1;
+SELECT test_sve_mode('force_scalar');
+test_sve_mode('force_scalar')
+1
+SELECT SQL_NO_CACHE COUNT(*) FROM (SELECT v FROM t_sve_sql ORDER BY v COLLATE utf8mb4_general_ci, BINARY v LIMIT 512) AS q;
+COUNT(*)
+512
+Warnings:
+Warning	1681	'SQL_NO_CACHE' is deprecated and will be removed in a future release.
+Warning	1287	'BINARY expr' is deprecated and will be removed in a future release. Please use CAST instead
+INSERT INTO t_sve_perf_sql
+SELECT 'order', 'force_scalar', TIMER_WAIT
+FROM performance_schema.events_statements_history_long
+WHERE THREAD_ID = @thread_id
+AND SQL_TEXT = "SELECT SQL_NO_CACHE COUNT(*) FROM (SELECT v FROM t_sve_sql ORDER BY v COLLATE utf8mb4_general_ci, BINARY v LIMIT 512) AS q"
+ORDER BY EVENT_ID DESC LIMIT 1;
+SELECT SQL_NO_CACHE COUNT(*) FROM (SELECT v COLLATE utf8mb4_general_ci AS k, COUNT(*) AS c FROM t_sve_sql GROUP BY v COLLATE utf8mb4_general_ci) AS q;
+COUNT(*)
+256
+Warnings:
+Warning	1681	'SQL_NO_CACHE' is deprecated and will be removed in a future release.
+INSERT INTO t_sve_perf_sql
+SELECT 'group', 'force_scalar', TIMER_WAIT
+FROM performance_schema.events_statements_history_long
+WHERE THREAD_ID = @thread_id
+AND SQL_TEXT = "SELECT SQL_NO_CACHE COUNT(*) FROM (SELECT v COLLATE utf8mb4_general_ci AS k, COUNT(*) AS c FROM t_sve_sql GROUP BY v COLLATE utf8mb4_general_ci) AS q"
+ORDER BY EVENT_ID DESC LIMIT 1;
+SELECT SQL_NO_CACHE COUNT(*) FROM t_sve_sql WHERE v LIKE 'abc%';
+COUNT(*)
+1024
+Warnings:
+Warning	1681	'SQL_NO_CACHE' is deprecated and will be removed in a future release.
+INSERT INTO t_sve_perf_sql
+SELECT 'like', 'force_scalar', TIMER_WAIT
+FROM performance_schema.events_statements_history_long
+WHERE THREAD_ID = @thread_id
+AND SQL_TEXT = "SELECT SQL_NO_CACHE COUNT(*) FROM t_sve_sql WHERE v LIKE 'abc%'"
+ORDER BY EVENT_ID DESC LIMIT 1;
+SELECT test_sve_mode('force_scalar');
+test_sve_mode('force_scalar')
+1
+SELECT SQL_NO_CACHE COUNT(*) FROM (SELECT v FROM t_sve_sql ORDER BY v COLLATE utf8mb4_general_ci, BINARY v LIMIT 512) AS q;
+COUNT(*)
+512
+Warnings:
+Warning	1681	'SQL_NO_CACHE' is deprecated and will be removed in a future release.
+Warning	1287	'BINARY expr' is deprecated and will be removed in a future release. Please use CAST instead
+INSERT INTO t_sve_perf_sql
+SELECT 'order', 'force_scalar', TIMER_WAIT
+FROM performance_schema.events_statements_history_long
+WHERE THREAD_ID = @thread_id
+AND SQL_TEXT = "SELECT SQL_NO_CACHE COUNT(*) FROM (SELECT v FROM t_sve_sql ORDER BY v COLLATE utf8mb4_general_ci, BINARY v LIMIT 512) AS q"
+ORDER BY EVENT_ID DESC LIMIT 1;
+SELECT SQL_NO_CACHE COUNT(*) FROM (SELECT v COLLATE utf8mb4_general_ci AS k, COUNT(*) AS c FROM t_sve_sql GROUP BY v COLLATE utf8mb4_general_ci) AS q;
+COUNT(*)
+256
+Warnings:
+Warning	1681	'SQL_NO_CACHE' is deprecated and will be removed in a future release.
+INSERT INTO t_sve_perf_sql
+SELECT 'group', 'force_scalar', TIMER_WAIT
+FROM performance_schema.events_statements_history_long
+WHERE THREAD_ID = @thread_id
+AND SQL_TEXT = "SELECT SQL_NO_CACHE COUNT(*) FROM (SELECT v COLLATE utf8mb4_general_ci AS k, COUNT(*) AS c FROM t_sve_sql GROUP BY v COLLATE utf8mb4_general_ci) AS q"
+ORDER BY EVENT_ID DESC LIMIT 1;
+SELECT SQL_NO_CACHE COUNT(*) FROM t_sve_sql WHERE v LIKE 'abc%';
+COUNT(*)
+1024
+Warnings:
+Warning	1681	'SQL_NO_CACHE' is deprecated and will be removed in a future release.
+INSERT INTO t_sve_perf_sql
+SELECT 'like', 'force_scalar', TIMER_WAIT
+FROM performance_schema.events_statements_history_long
+WHERE THREAD_ID = @thread_id
+AND SQL_TEXT = "SELECT SQL_NO_CACHE COUNT(*) FROM t_sve_sql WHERE v LIKE 'abc%'"
+ORDER BY EVENT_ID DESC LIMIT 1;
+SET @order_auto_med := (
+SELECT CAST(SUBSTRING_INDEX(SUBSTRING_INDEX(GROUP_CONCAT(timer_wait ORDER BY timer_wait), ',', 3), ',', -1) AS UNSIGNED)
+FROM t_sve_perf_sql WHERE kind='order' AND mode='auto'
+);
+SET @order_scalar_med := (
+SELECT CAST(SUBSTRING_INDEX(SUBSTRING_INDEX(GROUP_CONCAT(timer_wait ORDER BY timer_wait), ',', 3), ',', -1) AS UNSIGNED)
+FROM t_sve_perf_sql WHERE kind='order' AND mode='force_scalar'
+);
+SET @group_auto_med := (
+SELECT CAST(SUBSTRING_INDEX(SUBSTRING_INDEX(GROUP_CONCAT(timer_wait ORDER BY timer_wait), ',', 3), ',', -1) AS UNSIGNED)
+FROM t_sve_perf_sql WHERE kind='group' AND mode='auto'
+);
+SET @group_scalar_med := (
+SELECT CAST(SUBSTRING_INDEX(SUBSTRING_INDEX(GROUP_CONCAT(timer_wait ORDER BY timer_wait), ',', 3), ',', -1) AS UNSIGNED)
+FROM t_sve_perf_sql WHERE kind='group' AND mode='force_scalar'
+);
+SET @like_auto_med := (
+SELECT CAST(SUBSTRING_INDEX(SUBSTRING_INDEX(GROUP_CONCAT(timer_wait ORDER BY timer_wait), ',', 3), ',', -1) AS UNSIGNED)
+FROM t_sve_perf_sql WHERE kind='like' AND mode='auto'
+);
+SET @like_scalar_med := (
+SELECT CAST(SUBSTRING_INDEX(SUBSTRING_INDEX(GROUP_CONCAT(timer_wait ORDER BY timer_wait), ',', 3), ',', -1) AS UNSIGNED)
+FROM t_sve_perf_sql WHERE kind='like' AND mode='force_scalar'
+);
+SELECT @order_auto_med > 0 AND @order_scalar_med > 0 AS order_timing_collected;
+order_timing_collected
+1
+SELECT @group_auto_med > 0 AND @group_scalar_med > 0 AS group_timing_collected;
+group_timing_collected
+1
+SELECT @like_auto_med > 0 AND @like_scalar_med > 0 AS like_timing_collected;
+like_timing_collected
+1
+DROP TEMPORARY TABLE t_sve_perf_numchars;
+DROP TEMPORARY TABLE t_sve_perf_sql;
+DROP TABLE IF EXISTS t_sve_sql;
+DROP TABLE IF EXISTS t_sve_mem;
+DROP TABLE IF EXISTS t_sve_part;
+UNINSTALL COMPONENT "file://component_test_utf8mb4_sve";

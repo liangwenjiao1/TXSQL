@@ -2193,6 +2193,31 @@ TEST(StrxfrmTest, Contractions) {
   EXPECT_LT(compare_through_strxfrm(hu_ai_ci, "cukor", "csak"), 0);
 }
 
+TEST(StrxfrmTest, LegacyUcaContractions) {
+  CHARSET_INFO *hu_ci = init_collation("utf8mb4_hungarian_ci");
+  CHARSET_INFO *cs_ai_ci = init_collation("utf8mb4_cs_0900_ai_ci");
+
+  EXPECT_LT(compare_through_strxfrm(hu_ci, "c", "cs"), 0);
+  EXPECT_LT(compare_through_strxfrm(hu_ci, "cs", "d"), 0);
+
+  EXPECT_LT(compare_through_strxfrm(cs_ai_ci, "h", "ch"), 0);
+  EXPECT_LT(compare_through_strxfrm(cs_ai_ci, "ch", "i"), 0);
+  EXPECT_LT(compare_through_strxfrm(cs_ai_ci, "ha", "cha"), 0);
+}
+
+TEST(StrxfrmTest, TailoredNonContractionCollations) {
+  CHARSET_INFO *spanish_ci = init_collation("utf8mb4_spanish_ci");
+  CHARSET_INFO *spanish_900_ai_ci = init_collation("utf8mb4_es_0900_ai_ci");
+
+  EXPECT_LT(compare_through_strxfrm(spanish_ci, "n", u8"ñ"), 0);
+  EXPECT_LT(compare_through_strxfrm(spanish_ci, u8"ñ", "o"), 0);
+  EXPECT_EQ(compare_through_strxfrm(spanish_ci, u8"Ñ", u8"ñ"), 0);
+
+  EXPECT_LT(compare_through_strxfrm(spanish_900_ai_ci, "n", u8"ñ"), 0);
+  EXPECT_LT(compare_through_strxfrm(spanish_900_ai_ci, u8"ñ", "o"), 0);
+  EXPECT_EQ(compare_through_strxfrm(spanish_900_ai_ci, u8"Ñ", u8"ñ"), 0);
+}
+
 /*
   This test is disabled by default since it needs ~10 seconds to run,
   even in optimized mode.
@@ -2255,6 +2280,20 @@ uint64 hash(CHARSET_INFO *cs, const char *str) {
   return nr1;
 }
 
+void expect_strnxfrm_respects_dstlen(CHARSET_INFO *cs, const char *src,
+                                     size_t dstlen) {
+  std::vector<uchar> buffer(dstlen + 8, 0xA5);
+  const size_t srclen = strlen(src);
+  const size_t written = cs->coll->strnxfrm(
+      cs, buffer.data(), dstlen, srclen, pointer_cast<const uchar *>(src),
+      srclen, 0);
+
+  EXPECT_LE(written, dstlen);
+  for (size_t i = dstlen; i < buffer.size(); ++i) {
+    EXPECT_EQ(buffer[i], 0xA5);
+  }
+}
+
 /*
   NOTE: In this entire test, there's an infinitesimal chance
   that something that we expect doesn't match, still matches
@@ -2291,6 +2330,17 @@ TEST(PadCollationTest, HashSort) {
   EXPECT_NE(hash(as_cs, "ab  c"), hash(as_cs, "abc"));
 }
 
+TEST(HashTest, TailoredCollations) {
+  CHARSET_INFO *spanish_ci = init_collation("utf8mb4_spanish_ci");
+  CHARSET_INFO *spanish_900_ai_ci = init_collation("utf8mb4_es_0900_ai_ci");
+
+  EXPECT_EQ(hash(spanish_ci, u8"ñ"), hash(spanish_ci, u8"Ñ"));
+  EXPECT_NE(hash(spanish_ci, "n"), hash(spanish_ci, u8"ñ"));
+
+  EXPECT_EQ(hash(spanish_900_ai_ci, u8"ñ"), hash(spanish_900_ai_ci, u8"Ñ"));
+  EXPECT_NE(hash(spanish_900_ai_ci, "n"), hash(spanish_900_ai_ci, u8"ñ"));
+}
+
 TEST(HashTest, NullPointer) {
   CHARSET_INFO *cs = init_collation("utf8mb4_0900_ai_ci");
   uint64 nr1 = 1, nr2 = 4;
@@ -2305,6 +2355,67 @@ TEST(HashTest, NullPointer) {
   cs->coll->hash_sort(cs, pointer_cast<const uchar *>("        "), 8, &nr1,
                       &nr2);
   // Don't care what the values are, just that we don't crash.
+}
+
+TEST(StrxfrmTest, SmallDestinationDoesNotOverflow) {
+  static constexpr char kAsciiInput[] = "abcdefghijklmnop";
+
+  expect_strnxfrm_respects_dstlen(init_collation("utf8mb4_unicode_ci"),
+                                  kAsciiInput, 31);
+  expect_strnxfrm_respects_dstlen(init_collation("utf8mb4_spanish_ci"),
+                                  kAsciiInput, 31);
+  expect_strnxfrm_respects_dstlen(init_collation("utf8mb4_0900_ai_ci"),
+                                  kAsciiInput, 31);
+  expect_strnxfrm_respects_dstlen(init_collation("utf8mb4_es_0900_ai_ci"),
+                                  kAsciiInput, 31);
+}
+
+TEST(ConvertTest, AsciiOnlyCopiesWholeString) {
+  CHARSET_INFO *cs = init_collation("utf8mb4_0900_ai_ci");
+  ASSERT_NE(nullptr, cs);
+
+  const string src = "Plain ASCII text 123";
+  char buf[64] = {};
+  uint errors = 1;
+
+  const size_t len =
+      my_convert(buf, sizeof(buf), cs, src.data(), src.size(), cs, &errors);
+
+  EXPECT_EQ(src.size(), len);
+  EXPECT_EQ(0U, errors);
+  EXPECT_EQ(src, string(buf, len));
+}
+
+TEST(ConvertTest, AsciiPrefixThenNonAsciiPreservesWholeResult) {
+  CHARSET_INFO *cs = init_collation("utf8mb4_0900_ai_ci");
+  ASSERT_NE(nullptr, cs);
+
+  const string src = string("ASCII prefix ") + u8"é" + " suffix";
+  char buf[64] = {};
+  uint errors = 1;
+
+  const size_t len =
+      my_convert(buf, sizeof(buf), cs, src.data(), src.size(), cs, &errors);
+
+  EXPECT_EQ(src.size(), len);
+  EXPECT_EQ(0U, errors);
+  EXPECT_EQ(src, string(buf, len));
+}
+
+TEST(ConvertTest, AsciiOnlyHonorsDestinationLength) {
+  CHARSET_INFO *cs = init_collation("utf8mb4_0900_ai_ci");
+  ASSERT_NE(nullptr, cs);
+
+  const string src = "ASCII truncation check";
+  char buf[5] = {};
+  uint errors = 1;
+
+  const size_t len = my_convert(buf, sizeof(buf), cs, src.data(), src.size(),
+                                cs, &errors);
+
+  EXPECT_EQ(sizeof(buf), len);
+  EXPECT_EQ(0U, errors);
+  EXPECT_EQ(src.substr(0, sizeof(buf)), string(buf, len));
 }
 
 namespace {

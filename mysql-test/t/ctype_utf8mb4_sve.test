@@ -1,0 +1,434 @@
+--source include/no_valgrind_without_big.inc
+--source include/ctype_utf8mb4_sve_common.inc
+
+--echo # 用例 1: 验证 utf8mb4_general_ci 下纯 ASCII 长串 strnncoll 与标量结果一致
+let $sve_expr= test_sve_strnncoll('utf8mb4_general_ci', HEX(REPEAT('a', @sve_len_unit * 3)), HEX(REPEAT('a', @sve_len_unit * 3)), 0);
+--source include/ctype_utf8mb4_sve_direct.inc
+if ($sve_metric_checks)
+{
+  SELECT @sve_auto_metrics NOT LIKE '%fast_calls=0%' AS auto_has_fast;
+  SELECT @sve_auto_metrics LIKE '%tail_bytes=0%' AS no_tail;
+}
+
+--echo # 用例 2: 验证 utf8mb4_general_ci 下 strcasecmp 大小写折叠与标量一致
+let $sve_expr= test_sve_strcasecmp('utf8mb4_general_ci', HEX('abcDEF'), HEX('ABCdef'));
+--source include/ctype_utf8mb4_sve_direct.inc
+SELECT @sve_auto_result = 0 AS casefold_equal;
+
+--echo # 用例 2a: 验证 utf8_general_ci 下纯 ASCII 长串 strcasecmp 与标量一致
+let $sve_expr= test_sve_strcasecmp('utf8_general_ci', HEX(REPEAT('abcDEF', @sve_len_unit)), HEX(REPEAT('ABCdef', @sve_len_unit)));
+--source include/ctype_utf8mb4_sve_direct.inc
+SELECT @sve_auto_result = 0 AS utf8_casefold_equal;
+if ($sve_metric_checks)
+{
+  SELECT @sve_auto_metrics LIKE '%fast_calls=0%' AS utf8_general_no_fast;
+}
+
+--echo # 用例 2b: 验证 utf8_general_ci 下 hash_sort 的 ASCII 快路径与标量一致
+let $sve_expr= test_sve_hash_sort('utf8_general_ci', HEX(REPEAT('AbCd', @sve_len_unit)));
+--source include/ctype_utf8mb4_sve_direct.inc
+if ($sve_metric_checks)
+{
+  SELECT @sve_auto_metrics LIKE '%fast_calls=0%' AS utf8_general_hash_no_fast;
+}
+
+--echo # 用例 2c: 验证 utf8mb4_general_ci 下 hash_sort 的 ASCII 快路径与标量一致
+let $sve_expr= test_sve_hash_sort('utf8mb4_general_ci', HEX(REPEAT('AbCd', @sve_len_unit)));
+--source include/ctype_utf8mb4_sve_direct.inc
+if ($sve_metric_checks)
+{
+  SELECT @sve_auto_metrics NOT LIKE '%fast_calls=0%' AS utf8mb4_general_hash_has_fast;
+}
+
+--echo # 用例 2d: 验证 utf8mb4_general_ci 下 exact-lane strnxfrm 命中 ASCII to unicode 快路径
+let $sve_expr= test_sve_strnxfrm_hex('utf8mb4_general_ci', HEX(REPEAT('AbCd', @sve_len_unit / 4)), @sve_len_unit * 2, 0);
+--source include/ctype_utf8mb4_sve_direct.inc
+if ($sve_metric_checks)
+{
+  SELECT @sve_auto_metrics NOT LIKE '%fast_calls=0%' AS utf8mb4_general_strnxfrm_has_fast;
+  SELECT @sve_auto_metrics LIKE '%tail_bytes=0%' AS utf8mb4_general_strnxfrm_no_tail;
+}
+
+--echo # 用例 2e: 验证 utf8_general_ci 下 exact-lane strnxfrm 命中 ASCII to unicode 快路径
+let $sve_expr= test_sve_strnxfrm_hex('utf8_general_ci', HEX(REPEAT('AbCd', @sve_len_unit / 4)), @sve_len_unit * 2, 0);
+--source include/ctype_utf8mb4_sve_direct.inc
+if ($sve_metric_checks)
+{
+  SELECT @sve_auto_metrics NOT LIKE '%fast_calls=0%' AS utf8_general_strnxfrm_has_fast;
+  SELECT @sve_auto_metrics LIKE '%tail_bytes=0%' AS utf8_general_strnxfrm_no_tail;
+}
+
+--echo # 用例 3: 验证 utf8mb4_0900_ai_ci 下纯 ASCII strnxfrm 与标量一致，并保持标量路径
+let $sve_expr= test_sve_strnxfrm_hex('utf8mb4_0900_ai_ci', HEX(REPEAT('a', @sve_len_unit * 2)), @sve_len_unit * 4, 0);
+--source include/ctype_utf8mb4_sve_direct.inc
+if ($sve_metric_checks)
+{
+  SELECT @sve_auto_metrics LIKE '%fast_calls=0%' AS uca900_no_fast;
+}
+
+--echo # 用例 3a: 验证 utf8mb4_0900_ai_ci 下纯 ASCII exact-lane strnncoll 与标量一致
+let $sve_expr= test_sve_strnncoll('utf8mb4_0900_ai_ci', HEX(REPEAT('a', @sve_len_unit)), HEX(REPEAT('A', @sve_len_unit)), 0);
+--source include/ctype_utf8mb4_sve_direct.inc
+SELECT @sve_auto_result = 0 AS uca900_compare_equal;
+if ($sve_metric_checks)
+{
+  SELECT @sve_auto_metrics NOT LIKE '%fast_calls=0%' AS uca900_compare_has_fast;
+  SELECT @sve_auto_metrics LIKE '%tail_bytes=0%' AS uca900_compare_no_tail;
+}
+
+--echo # 用例 3b: 验证 utf8mb4_0900_ai_ci 下 ASCII 权重差异可由快速路径直接判定
+let $sve_expr= test_sve_strnncoll('utf8mb4_0900_ai_ci', HEX(REPEAT('a', @sve_len_unit)), HEX(CONCAT(REPEAT('a', @sve_len_unit - 1), 'b')), 0);
+--source include/ctype_utf8mb4_sve_direct.inc
+SELECT @sve_auto_result < 0 AS uca900_compare_less;
+if ($sve_metric_checks)
+{
+  SELECT @sve_auto_metrics NOT LIKE '%fast_calls=0%' AS uca900_compare_diff_has_fast;
+}
+
+--echo # 用例 3c: 验证 utf8mb4_0900_ai_ci 的 prefix 比较仍使用原有标量路径
+let $sve_expr= test_sve_strnncoll('utf8mb4_0900_ai_ci', HEX(REPEAT('a', @sve_len_unit * 2)), HEX(REPEAT('A', @sve_len_unit)), 1);
+--source include/ctype_utf8mb4_sve_direct.inc
+SELECT @sve_auto_result = 0 AS uca900_prefix_equal;
+if ($sve_metric_checks)
+{
+SELECT @sve_auto_metrics LIKE '%fast_calls=0%' AS uca900_prefix_no_fast;
+}
+
+--echo # 用例 3d: 验证 utf8mb4_0900_ai_ci 下 hash_sort 与标量一致
+let $sve_expr= test_sve_hash_sort('utf8mb4_0900_ai_ci', HEX(REPEAT('AbCd', @sve_len_unit)));
+--source include/ctype_utf8mb4_sve_direct.inc
+if ($sve_metric_checks)
+{
+  SELECT @sve_auto_metrics NOT LIKE '%fast_calls=0%' AS uca900_hash_has_fast;
+}
+
+--echo # 用例 3e: 验证 utf8mb4_0900_ai_ci 下 caseup/casedn 大小写转换与标量一致
+let $sve_expr= test_sve_caseup('utf8mb4_0900_ai_ci', HEX(REPEAT('abCd', @sve_len_unit)));
+--source include/ctype_utf8mb4_sve_direct.inc
+SELECT CONVERT(@sve_auto_result USING utf8mb4) REGEXP 'term=1$' AS uca900_caseup_term_ok;
+if ($sve_metric_checks)
+{
+  SELECT @sve_auto_metrics NOT LIKE '%fast_calls=0%' AS uca900_caseup_has_fast;
+}
+let $sve_expr= test_sve_casedn('utf8mb4_0900_ai_ci', HEX(REPEAT('ABcD', @sve_len_unit)));
+--source include/ctype_utf8mb4_sve_direct.inc
+SELECT CONVERT(@sve_auto_result USING utf8mb4) REGEXP 'term=1$' AS uca900_casedn_term_ok;
+if ($sve_metric_checks)
+{
+  SELECT @sve_auto_metrics NOT LIKE '%fast_calls=0%' AS uca900_casedn_has_fast;
+}
+
+--echo # 用例 5: 验证 utf8mb4_unicode_ci 下 hash_sort 与标量一致
+let $sve_expr= test_sve_hash_sort('utf8mb4_unicode_ci', HEX(REPEAT('AbCd', @sve_len_unit)));
+--source include/ctype_utf8mb4_sve_direct.inc
+if ($sve_metric_checks)
+{
+  SELECT @sve_auto_metrics NOT LIKE '%fast_calls=0%' AS utf8mb4_unicode_has_fast;
+}
+
+--echo # 用例 5a: 验证 utf8_unicode_ci 下 hash_sort 与标量一致
+let $sve_expr= test_sve_hash_sort('utf8_unicode_ci', HEX(REPEAT('AbCd', @sve_len_unit)));
+--source include/ctype_utf8mb4_sve_direct.inc
+if ($sve_metric_checks)
+{
+  SELECT @sve_auto_metrics NOT LIKE '%fast_calls=0%' AS utf8_unicode_has_fast;
+}
+
+--echo # 用例 5b: 验证 utf8_unicode_ci 下纯 ASCII exact-lane strnncoll 与标量一致
+let $sve_expr= test_sve_strnncoll('utf8_unicode_ci', HEX(REPEAT('a', @sve_len_unit)), HEX(REPEAT('A', @sve_len_unit)), 0);
+--source include/ctype_utf8mb4_sve_direct.inc
+SELECT @sve_auto_result = 0 AS utf8_unicode_compare_equal;
+if ($sve_metric_checks)
+{
+  SELECT @sve_auto_metrics NOT LIKE '%fast_calls=0%' AS utf8_unicode_compare_has_fast;
+  SELECT @sve_auto_metrics LIKE '%tail_bytes=0%' AS utf8_unicode_compare_no_tail;
+}
+
+--echo # 用例 5c: 验证 utf8mb4_unicode_ci 下纯 ASCII exact-lane strnncoll 与标量一致
+let $sve_expr= test_sve_strnncoll('utf8mb4_unicode_ci', HEX(REPEAT('z', @sve_len_unit)), HEX(REPEAT('Z', @sve_len_unit)), 0);
+--source include/ctype_utf8mb4_sve_direct.inc
+SELECT @sve_auto_result = 0 AS utf8mb4_unicode_compare_equal;
+if ($sve_metric_checks)
+{
+  SELECT @sve_auto_metrics NOT LIKE '%fast_calls=0%' AS utf8mb4_unicode_compare_has_fast;
+  SELECT @sve_auto_metrics LIKE '%tail_bytes=0%' AS utf8mb4_unicode_compare_no_tail;
+}
+
+--echo # 用例 5d: 验证 utf8mb4_unicode_ci 下 ASCII 权重差异可由快速路径直接判定
+let $sve_expr= test_sve_strnncoll('utf8mb4_unicode_ci', HEX(REPEAT('a', @sve_len_unit)), HEX(CONCAT(REPEAT('a', @sve_len_unit - 1), 'b')), 0);
+--source include/ctype_utf8mb4_sve_direct.inc
+SELECT @sve_auto_result < 0 AS utf8mb4_unicode_compare_less;
+if ($sve_metric_checks)
+{
+  SELECT @sve_auto_metrics NOT LIKE '%fast_calls=0%' AS utf8mb4_unicode_diff_has_fast;
+}
+
+--echo # 用例 5e: 验证 utf8mb4_unicode_ci 的 prefix 比较仍使用原有标量路径
+let $sve_expr= test_sve_strnncoll('utf8mb4_unicode_ci', HEX(REPEAT('a', @sve_len_unit * 2)), HEX(REPEAT('A', @sve_len_unit)), 1);
+--source include/ctype_utf8mb4_sve_direct.inc
+SELECT @sve_auto_result = 0 AS utf8mb4_unicode_prefix_equal;
+if ($sve_metric_checks)
+{
+SELECT @sve_auto_metrics LIKE '%fast_calls=0%' AS utf8mb4_unicode_prefix_no_fast;
+}
+
+--echo # 用例 5g: 验证 utf8mb4_unicode_ci 下 lane+3 的 UCA 比较保留尾部回退
+let $sve_expr= test_sve_strnncoll('utf8mb4_unicode_ci', HEX(REPEAT('a', @sve_len_unit + 3)), HEX(REPEAT('A', @sve_len_unit + 3)), 0);
+--source include/ctype_utf8mb4_sve_direct.inc
+SELECT @sve_auto_result = 0 AS utf8mb4_unicode_lane_plus_three_equal;
+if ($sve_metric_checks)
+{
+  SELECT @sve_auto_metrics NOT LIKE '%fast_calls=0%' AS utf8mb4_unicode_lane_plus_three_has_fast;
+  SELECT @sve_auto_metrics LIKE '%tail_bytes=3%' AS utf8mb4_unicode_lane_plus_three_tail;
+}
+
+--echo # 用例 5h: 验证 utf8mb4_unicode_ci 遇到 non-printable ASCII 时仅 printable 前缀可进入 UCA SIMD 路径
+let $sve_expr= test_sve_strnncoll('utf8mb4_unicode_ci', HEX(CONCAT(REPEAT('a', @sve_len_unit), '1F')), HEX(CONCAT(REPEAT('a', @sve_len_unit), '1F')), 0);
+--source include/ctype_utf8mb4_sve_direct.inc
+SELECT @sve_auto_result = 0 AS utf8mb4_unicode_non_printable_equal;
+if ($sve_metric_checks)
+{
+SELECT @sve_auto_metrics NOT LIKE '%fast_calls=0%' AS utf8mb4_unicode_non_printable_prefix_fast;
+}
+
+--echo # 用例 5f: 明确当前版本不存在 utf8_0900_ai_ci，避免误将其视为 utf8mb3 范围
+SELECT COUNT(*) = 0 AS utf8_0900_ai_ci_absent
+FROM information_schema.collations
+WHERE collation_name = 'utf8_0900_ai_ci';
+
+--echo # 用例 6: 验证输入长度恰好等于 svcntb() 时完整命中一次批处理且无尾部回退
+let $sve_expr= test_sve_strnncoll('utf8mb4_general_ci', HEX(REPEAT('a', @sve_len_unit)), HEX(REPEAT('a', @sve_len_unit)), 0);
+--source include/ctype_utf8mb4_sve_direct.inc
+if ($sve_metric_checks)
+{
+  SELECT @sve_auto_metrics LIKE '%tail_bytes=0%' AS exact_lane_no_tail;
+}
+
+--echo # 用例 7: 验证输入长度 svcntb()+3 时前缀走 SVE、尾部走标量
+let $sve_expr= test_sve_strnncoll('utf8mb4_general_ci', HEX(REPEAT('a', @sve_len_unit + 3)), HEX(REPEAT('a', @sve_len_unit + 3)), 0);
+--source include/ctype_utf8mb4_sve_direct.inc
+if ($sve_metric_checks)
+{
+  SELECT @sve_auto_metrics LIKE '%tail_bytes=3%' AS lane_plus_three_tail;
+}
+
+--echo # 用例 8: 验证 ASCII 前缀加中文后缀时前缀可向量化、后缀回退标量且结果正确
+let $sve_expr= test_sve_strnncoll('utf8mb4_general_ci', HEX(CONCAT(REPEAT('a', @sve_len_unit * 2), '中文')), HEX(CONCAT(REPEAT('a', @sve_len_unit * 2), '中文')), 0);
+--source include/ctype_utf8mb4_sve_direct.inc
+if ($sve_metric_checks)
+{
+  SELECT @sve_auto_metrics NOT LIKE '%fast_calls=0%' AS mixed_prefix_fast;
+  SELECT @sve_auto_metrics NOT LIKE '%tail_bytes=0%' AS mixed_tail_seen;
+}
+
+--echo # 用例 9: 验证全中文字符串不进入 ASCII SVE 快路径，完整走标量逻辑
+let $sve_expr= test_sve_strnncoll('utf8mb4_general_ci', HEX(REPEAT('中文', @sve_len_unit)), HEX(REPEAT('中文', @sve_len_unit)), 0);
+--source include/ctype_utf8mb4_sve_direct.inc
+if ($sve_metric_checks)
+{
+SELECT @sve_auto_metrics LIKE '%fast_calls=0%' AS chinese_no_fast;
+}
+
+--echo # 用例 10: 验证非法 UTF8 比较不会崩溃，并回退到原有字节比较逻辑
+let $sve_expr= test_sve_strnncoll('utf8mb4_general_ci', CONCAT(HEX(REPEAT('a', @sve_len_unit)), 'FF'), CONCAT(HEX(REPEAT('a', @sve_len_unit)), 'FF'), 0);
+--source include/ctype_utf8mb4_sve_direct.inc
+if ($sve_metric_checks)
+{
+SELECT @sve_auto_metrics NOT LIKE '%invalid_fallback_calls=0%' AS invalid_fallback_seen;
+}
+
+--echo # 用例 12: 验证 my_charpos_mb3 定位第 svcntb() 个字符时偏移正确
+let $sve_expr= test_sve_charpos('utf8mb4_general_ci', HEX(REPEAT('a', @sve_len_unit + 5)), @sve_len_unit);
+--source include/ctype_utf8mb4_sve_direct.inc
+SELECT @sve_auto_result = @sve_len_unit AS charpos_exact;
+
+--echo # 用例 13: 验证 my_caseup_utf8mb4 原地处理纯 ASCII 串时输出和终止符正确
+let $sve_expr= test_sve_caseup('utf8mb4_general_ci', HEX(REPEAT('abCd', @sve_len_unit)));
+--source include/ctype_utf8mb4_sve_direct.inc
+SELECT CONVERT(@sve_auto_result USING utf8mb4) REGEXP 'term=1$' AS caseup_term_ok;
+
+--echo # 用例 14: 验证 my_casedn_utf8mb4 原地处理纯 ASCII 串时输出正确
+let $sve_expr= test_sve_casedn('utf8mb4_general_ci', HEX(REPEAT('ABcD', @sve_len_unit)));
+--source include/ctype_utf8mb4_sve_direct.inc
+SELECT CONVERT(@sve_auto_result USING utf8mb4) REGEXP 'term=1$' AS casedn_term_ok;
+
+--echo # 用例 15: 验证 my_strnncollsp_utf8mb4 对 PAD SPACE 语义保持不变
+let $sve_expr= test_sve_strnncollsp('utf8mb4_general_ci', HEX('a'), HEX('a   '));
+--source include/ctype_utf8mb4_sve_direct.inc
+SELECT @sve_auto_result = 0 AS pad_space_equal;
+
+--echo # 用例 15a: 验证 utf8_general_ci 下 strnncollsp 双指针连续空格跳过与标量一致
+let $sve_expr= test_sve_strnncollsp('utf8_general_ci', HEX(CONCAT('a', REPEAT(' ', @sve_len_unit * 3 + 5), 'b')), HEX(CONCAT('A', REPEAT(' ', @sve_len_unit * 3 + 5), 'B')));
+--source include/ctype_utf8mb4_sve_direct.inc
+SELECT @sve_auto_result = 0 AS utf8_dual_space_equal;
+
+--echo # 用例 15b: 验证 utf8mb4_general_ci 下 strnncollsp 双指针连续空格跳过与标量一致
+let $sve_expr= test_sve_strnncollsp('utf8mb4_general_ci', HEX(CONCAT('a', REPEAT(' ', @sve_len_unit * 3 + 5), 'b')), HEX(CONCAT('A', REPEAT(' ', @sve_len_unit * 3 + 5), 'B')));
+--source include/ctype_utf8mb4_sve_direct.inc
+SELECT @sve_auto_result = 0 AS utf8mb4_dual_space_equal;
+
+--echo # 用例 15c: 验证 utf8_unicode_ci 下 strnncollsp 双指针连续空格跳过与标量一致
+let $sve_expr= test_sve_strnncollsp('utf8_unicode_ci', HEX(CONCAT('a', REPEAT(' ', @sve_len_unit * 3 + 5), 'b')), HEX(CONCAT('A', REPEAT(' ', @sve_len_unit * 3 + 5), 'B')));
+--source include/ctype_utf8mb4_sve_direct.inc
+SELECT @sve_auto_result = 0 AS utf8_unicode_dual_space_equal;
+
+--echo # 用例 15d: 验证 utf8mb4_unicode_ci 下 strnncollsp 双指针连续空格跳过与标量一致
+let $sve_expr= test_sve_strnncollsp('utf8mb4_unicode_ci', HEX(CONCAT('a', REPEAT(' ', @sve_len_unit * 3 + 5), 'b')), HEX(CONCAT('A', REPEAT(' ', @sve_len_unit * 3 + 5), 'B')));
+--source include/ctype_utf8mb4_sve_direct.inc
+SELECT @sve_auto_result = 0 AS utf8mb4_unicode_dual_space_equal;
+
+--echo # 用例 15e: 验证 utf8mb4_0900_ai_ci 下 strnncollsp 双指针连续空格跳过与标量一致
+let $sve_expr= test_sve_strnncollsp('utf8mb4_0900_ai_ci', HEX(CONCAT('a', REPEAT(' ', @sve_len_unit * 3 + 5), 'b')), HEX(CONCAT('A', REPEAT(' ', @sve_len_unit * 3 + 5), 'B')));
+--source include/ctype_utf8mb4_sve_direct.inc
+SELECT @sve_auto_result = 0 AS uca900_dual_space_equal;
+
+--echo # 用例 16: 验证 my_strnxfrm_unicode_tmpl 在小缓冲区下不会越界写
+let $sve_expr= test_sve_strnxfrm_hex('utf8mb4_general_ci', HEX(REPEAT('abcd', 4)), 3, 0);
+--source include/ctype_utf8mb4_sve_direct.inc
+SELECT CONVERT(@sve_auto_result USING utf8mb4) REGEXP '^len=[0-3];hex=[0-9A-F]*;guard=1$' AS small_buf_guard_ok;
+
+--echo # 用例 17: 验证 my_strnxfrm_uca_900_tmpl 在奇数 dstlen 下保护性截断生效
+let $sve_expr= test_sve_strnxfrm_hex('utf8mb4_0900_ai_ci', HEX(REPEAT('abcd', 4)), 15, 0);
+--source include/ctype_utf8mb4_sve_direct.inc
+SELECT CONVERT(@sve_auto_result USING utf8mb4) REGEXP 'guard=1$' AS odd_dst_guard_ok;
+
+--echo # 用例 17a: 验证 utf8mb4_unicode_ci 在 PAD_TO_MAXLEN 下补齐空格权重且不越界
+let $sve_expr= test_sve_strnxfrm_hex('utf8mb4_unicode_ci', HEX(REPEAT('AbCd', @sve_len_unit / 4)), @sve_len_unit * 2 + 8, 128);
+--source include/ctype_utf8mb4_sve_direct.inc
+SELECT CONVERT(@sve_auto_result USING utf8mb4) REGEXP 'guard=1$' AS utf8mb4_unicode_pad_guard_ok;
+
+--echo # 用例 17b: 验证 utf8mb4_0900_ai_ci 在 PAD_TO_MAXLEN 下补零且不越界
+let $sve_expr= test_sve_strnxfrm_hex('utf8mb4_0900_ai_ci', HEX(REPEAT('abcd', @sve_len_unit / 4)), @sve_len_unit * 2 + 8, 128);
+--source include/ctype_utf8mb4_sve_direct.inc
+SELECT CONVERT(@sve_auto_result USING utf8mb4) REGEXP '^len=[0-9]+;hex=[0-9A-F]+;guard=1$' AS uca900_pad_guard_ok;
+
+--echo # 用例 18: 验证 utf8mb4_spanish_ci 下 n、ñ、Ñ 的排序与标量一致
+SELECT test_sve_mode('auto');
+SET @spanish_auto := (SELECT GROUP_CONCAT(HEX(v) ORDER BY v COLLATE utf8mb4_spanish_ci, BINARY v SEPARATOR ',') FROM (SELECT _utf8mb4'n' AS v UNION ALL SELECT _utf8mb4'ñ' UNION ALL SELECT _utf8mb4'Ñ') AS q);
+SELECT test_sve_mode('force_scalar');
+SET @spanish_scalar := (SELECT GROUP_CONCAT(HEX(v) ORDER BY v COLLATE utf8mb4_spanish_ci, BINARY v SEPARATOR ',') FROM (SELECT _utf8mb4'n' AS v UNION ALL SELECT _utf8mb4'ñ' UNION ALL SELECT _utf8mb4'Ñ') AS q);
+SELECT @spanish_auto = @spanish_scalar AS spanish_same_order;
+SELECT test_sve_mode('auto');
+
+--echo # 用例 18a: 验证 utf8mb4_spanish_ci 不再因旧版 UCA 属性匹配而进入 SVE 快路径
+let $sve_expr= test_sve_strnxfrm_hex('utf8mb4_spanish_ci', HEX(REPEAT('abcd', @sve_len_unit / 4)), @sve_len_unit * 2, 0);
+--source include/ctype_utf8mb4_sve_direct.inc
+if ($sve_metric_checks)
+{
+SELECT @sve_auto_metrics LIKE '%fast_calls=0%' AS utf8mb4_spanish_no_legacy_uca_fast;
+}
+
+--echo # 用例 19: 验证带 contraction 的排序规则不会进入 SVE UCA 快路径
+let $sve_expr= test_sve_strnxfrm_hex('utf8mb4_hungarian_ci', HEX('dzs'), 16, 0);
+--source include/ctype_utf8mb4_sve_direct.inc
+if ($sve_metric_checks)
+{
+SELECT @sve_auto_metrics LIKE '%fast_calls=0%' AS contraction_no_fast;
+SELECT @sve_auto_metrics NOT LIKE '%contraction_disabled_calls=0%' AS contraction_skip_reason;
+}
+
+--echo # 用例 20: 验证带 tailoring 的 UCA 900 排序规则不会进入 SVE 快路径
+let $sve_expr= test_sve_strnxfrm_hex('utf8mb4_es_0900_ai_ci', HEX('casa'), 32, 0);
+--source include/ctype_utf8mb4_sve_direct.inc
+if ($sve_metric_checks)
+{
+SELECT @sve_auto_metrics LIKE '%fast_calls=0%' AS tailoring_no_fast;
+}
+
+--echo # 用例 21b: 验证 utf8mb4_0900_ai_ci 遇到 non-printable ASCII 时仅 printable 前缀可进入 UCA SIMD 路径
+let $sve_expr= test_sve_strnncoll('utf8mb4_0900_ai_ci', HEX(CONCAT(REPEAT('a', @sve_len_unit), '1F')), HEX(CONCAT(REPEAT('A', @sve_len_unit), '1F')), 0);
+--source include/ctype_utf8mb4_sve_direct.inc
+SELECT @sve_auto_result = 0 AS uca900_non_printable_equal;
+if ($sve_metric_checks)
+{
+SELECT @sve_auto_metrics NOT LIKE '%fast_calls=0%' AS uca900_non_printable_prefix_fast;
+}
+
+--echo # 用例 23: 验证禁用 SVE 时所有路径都回退到标量逻辑
+SELECT test_sve_reset();
+SELECT test_sve_mode('force_scalar');
+SELECT test_sve_strnncoll('utf8mb4_general_ci', HEX(REPEAT('a', @sve_len_unit * 2)), HEX(REPEAT('a', @sve_len_unit * 2)), 0) AS force_scalar_result;
+SELECT CONVERT(test_sve_metrics() USING utf8mb4) LIKE '%fast_calls=0%' AS disabled_no_fast;
+SELECT test_sve_mode('auto');
+
+--echo # 用例 24: 验证纯 ASCII 的排序、分组、LIKE 和分区路由在 SQL 层与基线一致
+let $sve_sql_charset= utf8mb4;
+let $sve_sql_mem_collation= utf8mb4_unicode_ci;
+let $sve_sql_part_collation= utf8mb4_general_ci;
+--source include/ctype_utf8mb4_sve_sql.inc
+INSERT INTO t_sve_sql(v) VALUES ('abc'),('ABC'),('abd'),('abz'),('abc');
+INSERT INTO t_sve_mem(v) VALUES ('abc'),('ABC'),('abc');
+INSERT INTO t_sve_part(v) VALUES ('abc'),('abd'),('abe'),('abf');
+SELECT test_sve_mode('auto');
+SET @sql_order_auto := (SELECT GROUP_CONCAT(v ORDER BY v COLLATE utf8mb4_general_ci, BINARY v SEPARATOR ',') FROM t_sve_sql);
+SET @sql_group_auto := (SELECT GROUP_CONCAT(CONCAT(k, ':', c) ORDER BY k SEPARATOR ',') FROM (SELECT v COLLATE utf8mb4_general_ci AS k, COUNT(*) AS c FROM t_sve_sql GROUP BY v COLLATE utf8mb4_general_ci) AS q);
+SET @sql_like_auto := (SELECT GROUP_CONCAT(v ORDER BY v SEPARATOR ',') FROM t_sve_sql WHERE v LIKE 'ab%');
+SET @sql_mem_auto := (SELECT COUNT(*) FROM t_sve_mem WHERE v='abc');
+SET @sql_part_auto := (SELECT GROUP_CONCAT(v ORDER BY v SEPARATOR ',') FROM t_sve_part WHERE v IN ('abc', 'abd'));
+SET @sql_order_uca900_auto := (SELECT GROUP_CONCAT(v ORDER BY v COLLATE utf8mb4_0900_ai_ci, BINARY v SEPARATOR ',') FROM t_sve_sql);
+SELECT test_sve_mode('force_scalar');
+SET @sql_order_scalar := (SELECT GROUP_CONCAT(v ORDER BY v COLLATE utf8mb4_general_ci, BINARY v SEPARATOR ',') FROM t_sve_sql);
+SET @sql_group_scalar := (SELECT GROUP_CONCAT(CONCAT(k, ':', c) ORDER BY k SEPARATOR ',') FROM (SELECT v COLLATE utf8mb4_general_ci AS k, COUNT(*) AS c FROM t_sve_sql GROUP BY v COLLATE utf8mb4_general_ci) AS q);
+SET @sql_like_scalar := (SELECT GROUP_CONCAT(v ORDER BY v SEPARATOR ',') FROM t_sve_sql WHERE v LIKE 'ab%');
+SET @sql_mem_scalar := (SELECT COUNT(*) FROM t_sve_mem WHERE v='abc');
+SET @sql_part_scalar := (SELECT GROUP_CONCAT(v ORDER BY v SEPARATOR ',') FROM t_sve_part WHERE v IN ('abc', 'abd'));
+SET @sql_order_uca900_scalar := (SELECT GROUP_CONCAT(v ORDER BY v COLLATE utf8mb4_0900_ai_ci, BINARY v SEPARATOR ',') FROM t_sve_sql);
+SELECT @sql_order_auto = @sql_order_scalar AS sql_order_same;
+SELECT @sql_group_auto = @sql_group_scalar AS sql_group_same;
+SELECT @sql_like_auto = @sql_like_scalar AS sql_like_same;
+SELECT @sql_mem_auto = @sql_mem_scalar AS sql_mem_same;
+SELECT @sql_part_auto = @sql_part_scalar AS sql_part_same;
+SELECT @sql_order_uca900_auto = @sql_order_uca900_scalar AS sql_uca900_order_same;
+SELECT test_sve_mode('auto');
+
+--echo # 用例 25: 验证 MEMORY 引擎依赖 hash_sort 的等值比较行为不变
+SELECT @sql_mem_auto = 3 AS memory_expected_count;
+
+--echo # 用例 25a: 验证 utf8_general_ci / utf8_unicode_ci 在 SQL 层与基线一致
+let $sve_sql_charset= utf8;
+let $sve_sql_mem_collation= utf8_unicode_ci;
+let $sve_sql_part_collation= utf8_general_ci;
+--source include/ctype_utf8mb4_sve_sql.inc
+INSERT INTO t_sve_sql(v) VALUES ('abc'),('ABC'),('abd'),('abz'),('abc');
+INSERT INTO t_sve_mem(v) VALUES ('abc'),('ABC'),('abc');
+INSERT INTO t_sve_part(v) VALUES ('abc'),('abd'),('abe'),('abf');
+SELECT test_sve_mode('auto');
+SET @sql_utf8_order_auto := (SELECT GROUP_CONCAT(v ORDER BY v COLLATE utf8_general_ci, BINARY v SEPARATOR ',') FROM t_sve_sql);
+SET @sql_utf8_group_auto := (SELECT GROUP_CONCAT(CONCAT(k, ':', c) ORDER BY k SEPARATOR ',') FROM (SELECT v COLLATE utf8_general_ci AS k, COUNT(*) AS c FROM t_sve_sql GROUP BY v COLLATE utf8_general_ci) AS q);
+SET @sql_utf8_like_auto := (SELECT GROUP_CONCAT(v ORDER BY v SEPARATOR ',') FROM t_sve_sql WHERE v LIKE 'ab%');
+SET @sql_utf8_mem_auto := (SELECT COUNT(*) FROM t_sve_mem WHERE v='abc');
+SET @sql_utf8_part_auto := (SELECT GROUP_CONCAT(v ORDER BY v SEPARATOR ',') FROM t_sve_part WHERE v IN ('abc', 'abd'));
+SELECT test_sve_mode('force_scalar');
+SET @sql_utf8_order_scalar := (SELECT GROUP_CONCAT(v ORDER BY v COLLATE utf8_general_ci, BINARY v SEPARATOR ',') FROM t_sve_sql);
+SET @sql_utf8_group_scalar := (SELECT GROUP_CONCAT(CONCAT(k, ':', c) ORDER BY k SEPARATOR ',') FROM (SELECT v COLLATE utf8_general_ci AS k, COUNT(*) AS c FROM t_sve_sql GROUP BY v COLLATE utf8_general_ci) AS q);
+SET @sql_utf8_like_scalar := (SELECT GROUP_CONCAT(v ORDER BY v SEPARATOR ',') FROM t_sve_sql WHERE v LIKE 'ab%');
+SET @sql_utf8_mem_scalar := (SELECT COUNT(*) FROM t_sve_mem WHERE v='abc');
+SET @sql_utf8_part_scalar := (SELECT GROUP_CONCAT(v ORDER BY v SEPARATOR ',') FROM t_sve_part WHERE v IN ('abc', 'abd'));
+SELECT @sql_utf8_order_auto = @sql_utf8_order_scalar AS utf8_sql_order_same;
+SELECT @sql_utf8_group_auto = @sql_utf8_group_scalar AS utf8_sql_group_same;
+SELECT @sql_utf8_like_auto = @sql_utf8_like_scalar AS utf8_sql_like_same;
+SELECT @sql_utf8_mem_auto = @sql_utf8_mem_scalar AS utf8_sql_mem_same;
+SELECT @sql_utf8_part_auto = @sql_utf8_part_scalar AS utf8_sql_part_same;
+SELECT test_sve_mode('auto');
+SELECT @sql_utf8_mem_auto = 3 AS utf8_memory_expected_count;
+
+--echo # 用例 26: 验证 my_caseup_utf8 原地处理纯 ASCII 长串时输出和终止符正确
+let $sve_expr= test_sve_caseup('utf8_general_ci', HEX(REPEAT('abCd', @sve_len_unit)));
+--disable_warnings
+--source include/ctype_utf8mb4_sve_direct.inc
+--enable_warnings
+SELECT CONVERT(@sve_auto_result USING utf8mb4) REGEXP 'term=1$' AS utf8_caseup_term_ok;
+
+--echo # 用例 27: 验证 my_casedn_utf8 遇到 U+0130 时能正确回退标量并保持终止符
+let $sve_expr= test_sve_casedn('utf8_general_ci', HEX(CONCAT(REPEAT('AB', @sve_len_unit), CONVERT(0xC4B0 USING utf8))));
+--disable_warnings
+--source include/ctype_utf8mb4_sve_direct.inc
+--enable_warnings
+SELECT CONVERT(@sve_auto_result USING utf8mb4) REGEXP 'hex=[0-9A-F]*69;term=1$' AS utf8_casedn_shrink_ok;
+
+--disable_warnings
+DROP TABLE IF EXISTS t_sve_sql;
+DROP TABLE IF EXISTS t_sve_mem;
+DROP TABLE IF EXISTS t_sve_part;
+UNINSTALL COMPONENT "file://component_test_utf8mb4_sve";
+--enable_warnings

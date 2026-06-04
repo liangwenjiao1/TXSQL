@@ -1980,6 +1980,17 @@ static int my_strnncollsp_uca(const CHARSET_INFO *cs, Mb_wc mb_wc,
   return (s_res - t_res);
 }
 
+#if defined(__aarch64__)
+#define CTYPE_UCA
+#if defined(HAVE_SVE_ACLE)
+#include "ctype-sve-opt.cc"
+#else
+#include "ctype-neon-opt.cc"
+#endif
+#undef CTYPE_UCA
+#endif
+
+#ifndef CTYPE_UCA_OPTIMIZED
 /*
   Calculates hash value for the given string,
   according to the collation, and ignoring trailing spaces.
@@ -2102,6 +2113,7 @@ static size_t my_strnxfrm_uca(const CHARSET_INFO *cs, Mb_wc mb_wc, uchar *dst,
   }
   return dst - d0;
 }
+#endif
 
 static int my_uca_charcmp_900(const CHARSET_INFO *cs, my_wc_t wc1,
                               my_wc_t wc2) {
@@ -4845,6 +4857,7 @@ static bool my_coll_init_uca(CHARSET_INFO *cs, MY_CHARSET_LOADER *loader) {
   return create_tailoring(cs, loader);
 }
 
+#ifndef CTYPE_UCA_OPTIMIZED
 static int my_strnncoll_any_uca(const CHARSET_INFO *cs, const uchar *s,
                                 size_t slen, const uchar *t, size_t tlen,
                                 bool t_is_prefix) {
@@ -4937,14 +4950,15 @@ static int my_strnncollsp_uca_900(const CHARSET_INFO *cs, const uchar *s,
   // We are a NO PAD collation, so this is identical to strnncoll.
   return my_strnncoll_uca_900(cs, s, slen, t, tlen, false);
 }
+#endif
 
 }  // extern "C"
 
+#ifndef CTYPE_UCA_OPTIMIZED
 template <class Mb_wc, int LEVELS_FOR_COMPARE>
 static void my_hash_sort_uca_900_tmpl(const CHARSET_INFO *cs, const Mb_wc mb_wc,
                                       const uchar *s, size_t slen, uint64 *n1) {
   uca_scanner_900<Mb_wc, LEVELS_FOR_COMPARE> scanner(mb_wc, cs, s, slen);
-
   /*
     A variation of the FNV-1a hash. The differences between this and
     standard FNV-1a as described in literature are:
@@ -4983,6 +4997,7 @@ static void my_hash_sort_uca_900_tmpl(const CHARSET_INFO *cs, const Mb_wc mb_wc,
 
   *n1 = h;
 }
+#endif
 
 extern "C" {
 
@@ -5049,9 +5064,8 @@ static size_t my_strnxfrm_uca_900_tmpl(const CHARSET_INFO *cs,
   uchar *dst_end = dst + dstlen;
   uca_scanner_900<Mb_wc, LEVELS_FOR_COMPARE> scanner(mb_wc, cs, src, srclen);
 
-  assert((dstlen % 2) == 0);
   if ((dstlen % 2) == 1) {
-    // Emergency workaround for optimized mode.
+    // Preserve the caller's buffer limit for odd-sized destinations.
     --dst_end;
   }
 

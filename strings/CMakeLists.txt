@@ -58,6 +58,36 @@ SET(STRINGS_SOURCES
   xml.cc
 )
 
+# Build SVE sources only when the compiler can use SVE ACLE with an explicit
+# ISA flag. Otherwise, keep the build on the NEON/scalar path.
+IF(CMAKE_SYSTEM_PROCESSOR STREQUAL "aarch64")
+  CMAKE_PUSH_CHECK_STATE(RESET)
+  SET(CMAKE_REQUIRED_FLAGS "-march=armv8.2-a+sve")
+  CHECK_CXX_SOURCE_COMPILES("
+  #include <arm_sve.h>
+  int main() {
+    svbool_t pg = svptrue_b8();
+    svuint8_t v = svdup_u8(0);
+    (void)pg;
+    (void)v;
+    return 0;
+  }"
+  HAVE_SVE_ACLE)
+  CMAKE_POP_CHECK_STATE()
+
+  IF(HAVE_SVE_ACLE)
+    LIST(APPEND STRINGS_SOURCES ctype_sve_test.cc)
+    ADD_COMPILE_FLAGS(ctype.cc COMPILE_FLAGS "-march=armv8.2-a+sve")
+    ADD_COMPILE_FLAGS(ctype-utf8.cc COMPILE_FLAGS "-march=armv8.2-a+sve")
+    ADD_COMPILE_FLAGS(ctype-uca.cc COMPILE_FLAGS "-march=armv8.2-a+sve")
+    ADD_COMPILE_FLAGS(ctype-mb.cc COMPILE_FLAGS "-march=armv8.2-a+sve")
+    ADD_COMPILE_FLAGS(ctype_sve_test.cc COMPILE_FLAGS "-march=armv8.2-a+sve")
+    MY_ADD_COMPILE_DEFINITIONS(
+      ctype.cc ctype-utf8.cc ctype-uca.cc ctype-mb.cc ctype_sve_test.cc
+      COMPILE_DEFINITIONS HAVE_SVE_ACLE HAVE_ARMV8_SVE)
+  ENDIF()
+ENDIF()
+
 # Aliasing bug in union in Clang
 # Bug#26161442 MAIN.SELECT* TESTS ARE FAILING WITH CLANG 4.0
 # Problem: wrong results for some corner cases when converting string to double.
@@ -94,9 +124,26 @@ SET_SOURCE_FILES_PROPERTIES(
   )
 
 LIST(APPEND STRINGS_SOURCES ${JA_HANS_DST_FILE} ${ZH_HANS_DST_FILE})
+
+IF(DEFINED MY_SVE_TEST_INSTRUMENTATION_LEVEL)
+  SET(STRINGS_SVE_TEST_INSTRUMENTATION_LEVEL
+    ${MY_SVE_TEST_INSTRUMENTATION_LEVEL})
+ELSEIF(WITH_UNIT_TESTS OR CMAKE_BUILD_TYPE_UPPER STREQUAL "DEBUG" OR WITH_DEBUG)
+  SET(STRINGS_SVE_TEST_INSTRUMENTATION_LEVEL 0)
+ELSE()
+  SET(STRINGS_SVE_TEST_INSTRUMENTATION_LEVEL 0)
+ENDIF()
+
+IF(NOT STRINGS_SVE_TEST_INSTRUMENTATION_LEVEL MATCHES "^[01]$")
+  MESSAGE(FATAL_ERROR
+    "MY_SVE_TEST_INSTRUMENTATION_LEVEL must be 0 or 1")
+ENDIF()
+
 # Avoid dependencies on perschema data defined in mysys
 ADD_DEFINITIONS(-DDISABLE_MYSQL_THREAD_H)
 ADD_CONVENIENCE_LIBRARY(strings ${STRINGS_SOURCES}
+  COMPILE_DEFINITIONS
+    MY_SVE_TEST_INSTRUMENTATION_LEVEL=${STRINGS_SVE_TEST_INSTRUMENTATION_LEVEL}
   LINK_LIBRARIES mysys
   )
 

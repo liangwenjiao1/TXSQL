@@ -107,6 +107,7 @@ component_example_component3    plugin_output_directory  no  EXAMPLE_COMPONENT_3
 component_test_string_service   plugin_output_directory  no  TEST_STRING_SERVICE
 component_test_string_service_long   plugin_output_directory  no  TEST_STRING_SERVICE_LONG
 component_test_string_service_charset   plugin_output_directory  no  TEST_STRING_SERVICE_CHARSET
+component_test_utf8mb4_sve   plugin_output_directory  no  TEST_UTF8MB4_SVE
 
 component_test_backup_lock_service   plugin_output_directory  no  TEST_BACKUP_LOCK_SERVICE
 # Test Performance Schema services

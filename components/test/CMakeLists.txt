@@ -159,3 +159,17 @@ MYSQL_ADD_COMPONENT(test_sensitive_system_variables
   MODULE_ONLY
   TEST_ONLY
   )
+MYSQL_ADD_COMPONENT(test_utf8mb4_sve
+  test_utf8mb4_sve.cc
+  ../../strings/ctype_sve_test.cc
+  MODULE_ONLY
+  TEST_ONLY
+  )
+
+IF(CMAKE_SYSTEM_PROCESSOR STREQUAL "aarch64" AND HAVE_SVE_ACLE)
+  ADD_COMPILE_FLAGS(../../strings/ctype_sve_test.cc
+                    COMPILE_FLAGS "-march=armv8.2-a+sve")
+  MY_ADD_COMPILE_DEFINITIONS(
+    ../../strings/ctype_sve_test.cc
+    COMPILE_DEFINITIONS HAVE_SVE_ACLE HAVE_ARMV8_SVE)
+ENDIF()

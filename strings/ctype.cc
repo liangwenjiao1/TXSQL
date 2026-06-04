@@ -938,6 +938,17 @@ static size_t my_convert_internal(char *to, size_t to_length,
   @return Number of bytes copied to 'to' string
 */
 
+#if defined(__aarch64__)
+#define CTYPE_CONVERT
+#if defined(HAVE_SVE_ACLE)
+#include "ctype-sve-opt.cc"
+#else
+#include "ctype-neon-opt.cc"
+#endif
+#undef CTYPE_CONVERT
+#endif
+
+#ifndef CTYPE_CONVERT_OPTIMIZED
 size_t my_convert(char *to, size_t to_length, const CHARSET_INFO *to_cs,
                   const char *from, size_t from_length,
                   const CHARSET_INFO *from_cs, uint *errors) {
@@ -984,6 +995,7 @@ size_t my_convert(char *to, size_t to_length, const CHARSET_INFO *to_cs,
   assert(false);  // Should never get to here
   return 0;       // Make compiler happy
 }
+#endif
 
 /**
   Get the length of the first code in given sequence of chars.
